@@ -33,6 +33,7 @@ class PredictResponse(BaseModel):
     confidence: float
     scores: dict
     indicators: list[str]
+    keywords: list[str]
     model_used: str
 
 class StatusResponse(BaseModel):
@@ -201,6 +202,76 @@ def rule_based_scores(headline: str, body: Optional[str]) -> tuple[float, float,
     return p_real_raw / total, p_cb / total, p_fake / total
 
 
+def extract_keywords(headline: str, body: Optional[str]) -> list[str]:
+    """Return the actual words/phrases from the text that matched suspicious patterns."""
+    full_text = headline + (" " + body[:600] if body else "")
+    headline_lower = headline.lower()
+    full_lower = full_text.lower()
+
+    found: list[str] = []
+    seen: set[str] = set()
+
+    # Word/phrase patterns — return the matched text directly
+    word_patterns = [
+        # clickbait
+        r"you won'?t believe",
+        r"shock(?:ing|ed|s)?",
+        r"what happens? next",
+        r"will blow your mind",
+        r"secret(?:ly|s)?",
+        r"amazing|incredible|unbelievable|stunning",
+        r"exclusive",
+        r"must.?(?:see|read|watch)",
+        r"viral",
+        r"\d+\s+(?:reasons|ways|things|facts|secrets|tips)",
+        r"how to\b.{0,40}(?:instantly|immediately|overnight|fast)",
+        r"\bOMG\b",
+        r"\bWOW\b",
+        # fake news
+        r"secret agenda",
+        r"deep state",
+        r"they don'?t want you to know",
+        r"wake up",
+        r"hoax",
+        r"scam",
+        r"conspiracy",
+        r"propaganda",
+        r"fraud",
+        r"stolen\s+election",
+        r"misinformation",
+        r"suppressed",
+        r"whistleblow\w*",
+    ]
+
+    for pattern in word_patterns:
+        m = re.search(pattern, full_lower)
+        if m:
+            kw = m.group(0).strip()
+            if kw and kw.lower() not in seen:
+                seen.add(kw.lower())
+                found.append(kw)
+
+    # Listicle pattern — extract the full match like "5 reasons"
+    m = re.search(r"\d+\s+(?:reasons|ways|things|facts|tips)", headline_lower)
+    if m:
+        kw = m.group(0).strip()
+        if kw.lower() not in seen:
+            seen.add(kw.lower())
+            found.append(kw)
+
+    # Meta signals
+    if re.search(r"!!+", headline):
+        found.append("!!! (multiple exclamation marks)")
+    elif re.search(r"!$", headline):
+        found.append("! (exclamation mark)")
+    if re.search(r"\?$", headline):
+        found.append("? (question headline)")
+    if caps_ratio(headline) > CAPS_THRESHOLD:
+        found.append("ALL CAPS")
+
+    return found[:12]
+
+
 def extract_indicators(
     headline: str, body: Optional[str], p_cb: float, p_fake: float, model_label: Optional[str]
 ) -> list[str]:
@@ -288,6 +359,7 @@ def predict(headline: str, body: Optional[str]) -> PredictResponse:
     confidence = round(scores_map[verdict] * 100, 1)
 
     indicators = extract_indicators(headline, body, p_cb, p_fake, model_label)
+    keywords = extract_keywords(headline, body)
 
     return PredictResponse(
         verdict=verdict,
@@ -298,6 +370,7 @@ def predict(headline: str, body: Optional[str]) -> PredictResponse:
             "fake": round(p_fake * 100, 1),
         },
         indicators=indicators,
+        keywords=keywords,
         model_used=model_name,
     )
 

@@ -43,7 +43,8 @@ export const AnalyzeNewsResponse = zod.object({
 }),
   "analyzedAt": zod.string().describe('ISO timestamp'),
   "modelUsed": zod.string(),
-  "indicators": zod.array(zod.string()).optional().describe('Text indicators that influenced the verdict')
+  "indicators": zod.array(zod.string()).optional().describe('Text indicators that influenced the verdict'),
+  "keywords": zod.array(zod.string()).optional().describe('Exact words or phrases found in the text that triggered the verdict')
 })
 
 

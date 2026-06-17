@@ -62,6 +62,8 @@ export interface AnalysisResult {
   modelUsed: string;
   /** Text indicators that influenced the verdict */
   indicators?: string[];
+  /** Exact words or phrases found in the text that triggered the verdict */
+  keywords?: string[];
 }
 
 /**

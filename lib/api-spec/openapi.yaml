@@ -207,6 +207,11 @@ components:
           items:
             type: string
           description: Text indicators that influenced the verdict
+        keywords:
+          type: array
+          items:
+            type: string
+          description: Exact words or phrases found in the text that triggered the verdict
 
     ScoreBreakdown:
       type: object

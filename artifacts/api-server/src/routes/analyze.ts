@@ -24,6 +24,7 @@ async function callMlService(headline: string, body?: string | null) {
     confidence: number;
     scores: { real: number; clickbait: number; fake: number };
     indicators: string[];
+    keywords: string[];
     model_used: string;
   }>;
 }
@@ -74,6 +75,7 @@ router.post("/analyze", async (req, res) => {
         fake: Number(inserted.scoreFake),
       },
       indicators: inserted.indicators,
+      keywords: mlResult.keywords ?? [],
       analyzedAt: inserted.analyzedAt.toISOString(),
       modelUsed: inserted.modelUsed,
     });

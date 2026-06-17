@@ -306,6 +306,31 @@ export default function Home() {
                     </div>
                   </div>
 
+                  {/* Trigger Keywords — only for FAKE or CLICKBAIT */}
+                  {currentResultFullData.verdict !== "REAL" &&
+                    currentResultFullData.keywords &&
+                    currentResultFullData.keywords.length > 0 && (
+                    <div className="space-y-3">
+                      <h4 className="font-mono text-xs font-semibold tracking-wider text-muted-foreground">
+                        TRIGGER_KEYWORDS
+                      </h4>
+                      <div className="flex flex-wrap gap-2">
+                        {currentResultFullData.keywords.map((kw, i) => (
+                          <span
+                            key={i}
+                            className={`inline-flex items-center px-2.5 py-1 rounded text-xs font-mono font-semibold border ${
+                              currentResultFullData.verdict === "CLICKBAIT"
+                                ? "bg-amber-500/10 border-amber-500/40 text-amber-400"
+                                : "bg-rose-500/10 border-rose-500/40 text-rose-400"
+                            }`}
+                          >
+                            {kw}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
                   {/* Indicators */}
                   {currentResultFullData.indicators && currentResultFullData.indicators.length > 0 && (
                     <div className="space-y-3">
