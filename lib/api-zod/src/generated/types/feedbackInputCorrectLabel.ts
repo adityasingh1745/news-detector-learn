@@ -15,5 +15,4 @@ export type FeedbackInputCorrectLabel = typeof FeedbackInputCorrectLabel[keyof t
 export const FeedbackInputCorrectLabel = {
   REAL: 'REAL',
   CLICKBAIT: 'CLICKBAIT',
-  FAKE: 'FAKE',
 } as const;

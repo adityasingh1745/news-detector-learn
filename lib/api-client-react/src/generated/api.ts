@@ -132,7 +132,7 @@ export const getAnalyzeNewsUrl = () => {
 
 /**
  * Submits a news headline and/or body for ML analysis
- * @summary Analyze news for fake/clickbait
+ * @summary Analyze news for clickbait
  */
 export const analyzeNews = async (newsInput: NewsInput, options?: RequestInit): Promise<AnalysisResult> => {
 
@@ -181,7 +181,7 @@ const {mutation: mutationOptions, request: requestOptions} = options ?
     export type AnalyzeNewsMutationError = ErrorType<ErrorResponse>
 
     /**
- * @summary Analyze news for fake/clickbait
+ * @summary Analyze news for clickbait
  */
 export const useAnalyzeNews = <TError = ErrorType<ErrorResponse>,
     TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof analyzeNews>>, TError,{data: BodyType<NewsInput>}, TContext>, request?: SecondParameter<typeof customFetch>}

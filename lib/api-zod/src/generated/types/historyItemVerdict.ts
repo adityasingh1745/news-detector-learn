@@ -12,5 +12,4 @@ export type HistoryItemVerdict = typeof HistoryItemVerdict[keyof typeof HistoryI
 export const HistoryItemVerdict = {
   REAL: 'REAL',
   CLICKBAIT: 'CLICKBAIT',
-  FAKE: 'FAKE',
 } as const;

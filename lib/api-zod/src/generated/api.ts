@@ -19,7 +19,7 @@ export const HealthCheckResponse = zod.object({
 
 /**
  * Submits a news headline and/or body for ML analysis
- * @summary Analyze news for fake/clickbait
+ * @summary Analyze news for clickbait
  */
 export const analyzeNewsBodyHeadlineMin = 3;
 
@@ -34,12 +34,11 @@ export const AnalyzeNewsResponse = zod.object({
   "id": zod.number(),
   "headline": zod.string(),
   "body": zod.string().nullish(),
-  "verdict": zod.enum(['REAL', 'CLICKBAIT', 'FAKE']).describe('Final verdict'),
+  "verdict": zod.enum(['REAL', 'CLICKBAIT']).describe('Final verdict'),
   "confidence": zod.number().describe('Confidence score 0-100 for the verdict'),
   "scores": zod.object({
   "real": zod.number().describe('Probability score 0-100 for REAL'),
-  "clickbait": zod.number().describe('Probability score 0-100 for CLICKBAIT'),
-  "fake": zod.number().describe('Probability score 0-100 for FAKE')
+  "clickbait": zod.number().describe('Probability score 0-100 for CLICKBAIT')
 }),
   "analyzedAt": zod.string().describe('ISO timestamp'),
   "modelUsed": zod.string(),
@@ -47,7 +46,7 @@ export const AnalyzeNewsResponse = zod.object({
   "keywords": zod.array(zod.object({
   "word": zod.string().describe('The exact word or phrase matched in the text'),
   "score": zod.number().describe('Severity score 0-100 for this specific keyword signal')
-})).optional().describe('Exact words or phrases found in the text that triggered the verdict, with per-keyword severity scores')
+})).optional().describe('Clickbait signals found in the text with per-keyword severity scores')
 })
 
 
@@ -57,7 +56,7 @@ export const AnalyzeNewsResponse = zod.object({
  */
 export const SubmitFeedbackBody = zod.object({
   "analysisId": zod.number().describe('The ID of the analysis being corrected'),
-  "correctLabel": zod.enum(['REAL', 'CLICKBAIT', 'FAKE']).describe('The correct label according to the user')
+  "correctLabel": zod.enum(['REAL', 'CLICKBAIT']).describe('The correct label according to the user')
 })
 
 
@@ -74,7 +73,7 @@ export const GetHistoryQueryParams = zod.object({
 export const GetHistoryResponseItem = zod.object({
   "id": zod.number(),
   "headline": zod.string(),
-  "verdict": zod.enum(['REAL', 'CLICKBAIT', 'FAKE']),
+  "verdict": zod.enum(['REAL', 'CLICKBAIT']),
   "confidence": zod.number(),
   "analyzedAt": zod.string(),
   "hasFeedback": zod.boolean().optional()
@@ -90,8 +89,7 @@ export const GetStatsResponse = zod.object({
   "totalAnalyzed": zod.number(),
   "verdictCounts": zod.object({
   "REAL": zod.number(),
-  "CLICKBAIT": zod.number(),
-  "FAKE": zod.number()
+  "CLICKBAIT": zod.number()
 }),
   "avgConfidence": zod.number(),
   "totalFeedback": zod.number(),

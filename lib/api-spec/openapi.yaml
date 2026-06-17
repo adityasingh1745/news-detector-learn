@@ -35,7 +35,7 @@ paths:
     post:
       operationId: analyzeNews
       tags: [analysis]
-      summary: Analyze news for fake/clickbait
+      summary: Analyze news for clickbait
       description: Submits a news headline and/or body for ML analysis
       requestBody:
         required: true
@@ -190,7 +190,7 @@ components:
           type: ["string", "null"]
         verdict:
           type: string
-          enum: [REAL, CLICKBAIT, FAKE]
+          enum: [REAL, CLICKBAIT]
           description: Final verdict
         confidence:
           type: number
@@ -211,14 +211,13 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/KeywordMatch"
-          description: Exact words or phrases found in the text that triggered the verdict, with per-keyword severity scores
+          description: Clickbait signals found in the text with per-keyword severity scores
 
     ScoreBreakdown:
       type: object
       required:
         - real
         - clickbait
-        - fake
       properties:
         real:
           type: number
@@ -226,9 +225,6 @@ components:
         clickbait:
           type: number
           description: Probability score 0-100 for CLICKBAIT
-        fake:
-          type: number
-          description: Probability score 0-100 for FAKE
 
     FeedbackInput:
       type: object
@@ -241,7 +237,7 @@ components:
           description: The ID of the analysis being corrected
         correctLabel:
           type: string
-          enum: [REAL, CLICKBAIT, FAKE]
+          enum: [REAL, CLICKBAIT]
           description: The correct label according to the user
 
     FeedbackResult:
@@ -274,7 +270,7 @@ components:
           type: string
         verdict:
           type: string
-          enum: [REAL, CLICKBAIT, FAKE]
+          enum: [REAL, CLICKBAIT]
         confidence:
           type: number
         analyzedAt:
@@ -308,13 +304,10 @@ components:
       required:
         - REAL
         - CLICKBAIT
-        - FAKE
       properties:
         REAL:
           type: integer
         CLICKBAIT:
-          type: integer
-        FAKE:
           type: integer
 
     KeywordMatch:

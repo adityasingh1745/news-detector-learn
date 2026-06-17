@@ -11,6 +11,4 @@ export interface ScoreBreakdown {
   real: number;
   /** Probability score 0-100 for CLICKBAIT */
   clickbait: number;
-  /** Probability score 0-100 for FAKE */
-  fake: number;
 }

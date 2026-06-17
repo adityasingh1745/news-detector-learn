@@ -1,6 +1,6 @@
 """
-Fake News & Clickbait Detection ML Service
-Uses HuggingFace transformers with rule-based fallback.
+News Credibility & Clickbait Detection ML Service
+Classifies headlines as REAL (credible journalism) or CLICKBAIT (sensational/bait).
 """
 import os
 import re
@@ -14,23 +14,20 @@ from pydantic import BaseModel
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Global state
-# ---------------------------------------------------------------------------
 classifier = None
 model_name = "loading"
 model_ready = False
 
-# ---------------------------------------------------------------------------
-# Models
-# ---------------------------------------------------------------------------
+
 class PredictRequest(BaseModel):
     headline: str
     body: Optional[str] = None
 
+
 class KeywordMatch(BaseModel):
     word: str
-    score: int  # 0-100 severity for this specific signal
+    score: int
+
 
 class PredictResponse(BaseModel):
     verdict: str
@@ -40,22 +37,20 @@ class PredictResponse(BaseModel):
     keywords: list[KeywordMatch]
     model_used: str
 
+
 class StatusResponse(BaseModel):
     ready: bool
     model_name: str
     feedback_count: int
     last_retrained: Optional[str]
 
-# ---------------------------------------------------------------------------
-# Lifespan — load model on startup
-# ---------------------------------------------------------------------------
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global classifier, model_name, model_ready
-    # Try models in order from smallest to largest
     CANDIDATE_MODELS = [
-        "GonzaloA/fake-news-bert-base-uncased",
         "hamzab/roberta-fake-news-classification",
+        "GonzaloA/fake-news-bert-base-uncased",
         "jy46604790/Fake-News-Bert-Detect",
     ]
     for candidate in CANDIDATE_MODELS:
@@ -78,83 +73,168 @@ async def lifespan(app: FastAPI):
             classifier = None
 
     if not model_ready:
-        logger.warning("All transformer models failed; using enhanced rule-based classifier")
-        model_name = "enhanced-rule-based-v1"
+        logger.warning("All transformer models failed; using rule-based classifier")
+        model_name = "rule-based-v2"
         model_ready = True
 
     yield
-    # Cleanup
     classifier = None
 
-app = FastAPI(title="Fake News ML Service", version="1.0.0", lifespan=lifespan)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app = FastAPI(title="News Credibility ML Service", version="2.0.0", lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
 
 # ---------------------------------------------------------------------------
-# Rule-based feature extraction
+# Pattern lists: (pattern, display_label, severity_score 0-100)
+# label=None means use matched text directly
 # ---------------------------------------------------------------------------
-# (pattern, display_label, severity_score)
-CB_SCORED: list[tuple[str, str, int]] = [
-    (r"you won'?t believe",        "you won't believe",    92),
-    (r"will blow your mind",        "will blow your mind",  95),
-    (r"what happens? next",         "what happens next",    72),
-    (r"must.?(?:see|read|watch)",   "must-see/read/watch",  75),
-    (r"how to\b.{0,40}(?:instantly|immediately|overnight|fast)", "how to ... instantly", 72),
-    (r"\d+\s+(?:reasons|ways|things|facts|secrets|tips)", None, 80),  # None = use matched text
-    (r"shock(?:ing|ed|s)?",         None,                   78),
-    (r"unbelievable|incredible",    None,                   74),
-    (r"amazing|stunning",           None,                   65),
-    (r"\bOMG\b",                    "OMG",                  85),
-    (r"\bWOW\b",                    "WOW",                  80),
-    (r"\bexclusive\b",              "exclusive",            60),
-    (r"\bviral\b",                  "viral",                65),
-    (r"secret(?:ly|s)?",            None,                   55),
+
+# CLICKBAIT patterns — signal sensationalism, curiosity-gap, emotional manipulation
+CB_SCORED: list[tuple[str, str | None, int]] = [
+    # Curiosity gap — classic bait
+    (r"you won'?t believe",                         "you won't believe",           95),
+    (r"will blow your mind",                        "will blow your mind",         95),
+    (r"the reason will shock you",                  "the reason will shock you",   92),
+    (r"you need to see this",                       "you need to see this",        90),
+    (r"they don'?t want you to know",               "they don't want you to know", 90),
+    (r"this (?:one )?(?:weird|simple) trick",       "this one weird trick",        92),
+    (r"doctors? (?:hate|won'?t tell) (?:him|her|you|this)", "doctors hate this",   90),
+    (r"what (?:happens?|happened) next",            "what happens next",           88),
+    (r"what nobody (?:tells?|told) you",            "what nobody tells you",       88),
+    (r"(?:can|could) you believe",                  "can you believe",             82),
+    (r"nobody (?:expected|saw|believes?) this",     "nobody expected this",        85),
+    (r"you (?:won'?t|wouldn'?t) guess",             "you wouldn't guess",          85),
+    (r"find out (?:why|how|what)",                  "find out why/how",            80),
+    (r"the (?:shocking|real|hidden|untold) truth",  "the hidden truth",            82),
+    (r"what (?:really|actually) happened?",         "what really happened",        78),
+    (r"secrets? (?:of|to|about|behind)",            "secret of/about",             75),
+    (r"the (?:real )?reason (?:why|that|behind)",   "the real reason",             72),
+    (r"(?:here'?s?|this is) why\b",                 "here's why",                  60),
+    (r"what (?:your|the) .{0,30} (?:doesn'?t|won'?t) (?:tell|want)", "what they won't tell", 82),
+    (r"(?:the|a) (?:shocking|surprising) reason",   "shocking reason",             80),
+    (r"you (?:should|need to|must) (?:see|know|watch|read|hear)", "you need to know", 75),
+    (r"what you (?:need to|should|must) know",      "what you need to know",       75),
+
+    # Listicles
+    (r"\b\d+\s+(?:shocking|amazing|incredible|surprising|unbelievable|mind.?blowing|crazy|insane)\b", None, 85),
+    (r"\b\d+\s+(?:reasons?|ways?|things?|facts?|secrets?|tips?|signs?|hacks?|tricks?|myths?|steps?)\b", None, 78),
+    (r"\b(?:top|best)\s+\d+\b",                     None,                          72),
+    (r"\b\d+\s+times?\b",                            None,                          65),
+
+    # Emotional shock language
+    (r"\bshock(?:ing|ed|er)?\b",                    None,                          78),
+    (r"\bunbelievable\b",                            None,                          74),
+    (r"\bmind.?blow(?:ing|s)?\b",                   "mind-blowing",                80),
+    (r"\bheart.?break(?:ing)?\b",                   "heartbreaking",               72),
+    (r"\boutrag(?:ed|ing|eous)\b",                  None,                          70),
+    (r"\bfurious\b",                                 None,                          68),
+    (r"\bdisgusting\b",                              None,                          72),
+    (r"\bcrazy\b",                                   None,                          55),
+    (r"\binsane\b",                                  None,                          58),
+    (r"\bstunning\b",                                None,                          62),
+    (r"\bincredible\b",                              None,                          60),
+    (r"\bamazing\b",                                 None,                          50),
+
+    # Attack/drama verbs used as clickbait
+    (r"\bslam(?:s|med|ming)?\b",                    None,                          68),
+    (r"\bdestroy(?:s|ed|ing)?\b",                   None,                          65),
+    (r"\bcrush(?:es|ed|ing)?\b",                    None,                          60),
+    (r"\bblast(?:s|ed|ing)?\b",                     None,                          60),
+    (r"\bexpose(?:s|d|ing)?\b",                     None,                          70),
+    (r"\bcaught on (?:camera|video|tape)\b",         "caught on camera",            82),
+    (r"\bgoes? (?:viral|off on|ballistic|crazy|nuts|wild)\b", "goes viral/off",    78),
+    (r"\blose(?:s|ing)?\s+it\b",                    "loses it",                    75),
+    (r"\bmelts? down\b",                             "meltdown",                    75),
+    (r"\bbreaks? the internet\b",                   "breaks the internet",          88),
+
+    # FOMO / urgency bait
+    (r"^\s*BREAKING\b",                              "BREAKING",                    65),
+    (r"\burgent(?:ly)?\b",                           None,                          68),
+    (r"\bbefore it'?s? too late\b",                 "before it's too late",         85),
+    (r"\bmust.?(?:see|watch|read|know)\b",           "must-see/watch",              78),
+    (r"\bdon'?t miss\b",                             "don't miss",                  72),
+
+    # Engagement bait
+    (r"\beveryone (?:should|needs? to|must)\b",      "everyone should",             72),
+    (r"\bshare (?:this|if you)\b",                   "share this",                  70),
+    (r"\bOMG\b",                                     "OMG",                         85),
+    (r"\bWOW\b",                                     "WOW",                         80),
+    (r"\bviral\b",                                   "viral",                       62),
+    (r"\bexclusive\b",                               "exclusive",                   58),
+
+    # Vague-pronoun clickbait ("This man did X")
+    (r"\bthis (?:man|woman|guy|girl|dad|mom|teacher|doctor|nurse|kid|teen|student)\b", None, 60),
 ]
 
-FAKE_SCORED: list[tuple[str, str, int]] = [
-    (r"they don'?t want you to know", "they don't want you to know", 95),
-    (r"stolen\s+election",          "stolen election",      95),
-    (r"deep state",                 "deep state",           92),
-    (r"\bhoax\b",                   "hoax",                 90),
-    (r"secret agenda",              "secret agenda",        88),
-    (r"\bconspiracy\b",             "conspiracy",           85),
-    (r"\bscam\b",                   "scam",                 82),
-    (r"\bsuppressed\b",             "suppressed",           82),
-    (r"\bpropaganda\b",             "propaganda",           80),
-    (r"\bfraud\b",                  "fraud",                78),
-    (r"\bmisinformation\b",         "misinformation",       75),
-    (r"whistleblow\w*",             None,                   65),
-    (r"\bwake up\b",                "wake up",              62),
-    (r"mainstream media\b.{0,30}(?:lie|hid|cover)",  "mainstream media lies", 85),
-    (r"\bpedogate\b",               "pedogate",             95),
+# REAL / CREDIBILITY patterns — signal factual, journalistic reporting
+REAL_SCORED: list[tuple[str, str | None, int]] = [
+    # Attribution language (strongest signals)
+    (r"\baccording to\b",                           "according to",                85),
+    (r"\bannounced\b",                              None,                          75),
+    (r"\bconfirmed\b",                              None,                          78),
+    (r"\bdenied\b",                                 None,                          68),
+    (r"\bstated\b",                                 None,                          65),
+    (r"\bpublished\b",                              None,                          62),
+    (r"\breported(?:ly)?\b",                        None,                          65),
+    (r"\bspokesp(?:erson|eople)\b",                 "spokesperson",                82),
+    (r"\bstatement\b",                              None,                          70),
+    (r"\bsaid\b",                                   None,                          55),
+    (r"\bresponded\b",                              None,                          62),
+
+    # Research / data language
+    (r"\bstudy (?:shows?|finds?|reveals?|suggests?)\b",    "study shows",         85),
+    (r"\bresearch (?:shows?|finds?|reveals?|suggests?|indicates?)\b", "research finds", 85),
+    (r"\bdata (?:shows?|reveals?|suggests?|indicates?)\b", "data shows",           80),
+    (r"\bsurvey\b",                                 None,                          68),
+    (r"\bpoll (?:shows?|finds?)\b",                 "poll finds",                  72),
+    (r"\bstatistics?\b",                            None,                          75),
+    (r"\banalysis\b",                               None,                          70),
+    (r"\bfindings?\b",                              None,                          68),
+    (r"\bevidence\b",                               None,                          72),
+    (r"\breport(?:ed)?\b",                          None,                          60),
+
+    # Institutions / authorities
+    (r"\buniversity\b",                             None,                          78),
+    (r"\bresearchers?\b",                           None,                          75),
+    (r"\bscientists?\b",                            None,                          72),
+    (r"\bgovernment\b",                             None,                          62),
+    (r"\bparliament\b",                             None,                          70),
+    (r"\bcongress\b",                               None,                          68),
+    (r"\bsenate\b",                                 None,                          68),
+    (r"\b(?:WHO|CDC|FDA|EPA|NIH|NATO|UN|EU)\b",     None,                          82),
+    (r"\bofficial(?:s|ly)?\b",                      None,                          68),
+    (r"\bminister\b",                               None,                          65),
+    (r"\bjudge (?:ruled|ordered|said)\b",           "judge ruled",                 78),
+    (r"\bcourt\b",                                  None,                          65),
+    (r"\bpolice\b",                                 None,                          58),
+
+    # Specific numbers as facts (e.g. "45% of", "$2.3 billion")
+    (r"\b\d+(?:\.\d+)?%\s+of\b",                   None,                          62),
+    (r"\$\d+(?:\.\d+)?\s*(?:billion|million|trillion)\b", None,                   65),
+
+    # Hedged / measured language
+    (r"\bsuggests?\b",                              None,                          60),
+    (r"\bindicates?\b",                             None,                          60),
+    (r"\bappears? to\b",                            None,                          55),
+    (r"\blikely\b",                                 None,                          52),
+    (r"\bmay\b",                                    None,                          48),
+    (r"\bcould\b",                                  None,                          46),
+
+    # Neutral reporting verbs
+    (r"\bvoted\b",                                  None,                          62),
+    (r"\belected\b",                                None,                          65),
+    (r"\bappointed\b",                              None,                          62),
+    (r"\barrested\b",                               None,                          65),
+    (r"\bcharged\b",                                None,                          62),
+    (r"\bconvicted\b",                              None,                          68),
+    (r"\bpassed\b",                                 None,                          55),
+    (r"\bsigned\b",                                 None,                          60),
+    (r"\breleased\b",                               None,                          55),
+    (r"\bapproved\b",                               None,                          60),
 ]
 
-CREDIBLE_PHRASES = [
-    r"\baccording to\b",
-    r"\bstudies show\b",
-    r"\bresearch (shows|finds|indicates|suggests)\b",
-    r"\bexperts say\b",
-    r"\bofficial(s|ly)?\b",
-    r"\bstatement\b",
-    r"\bconference\b",
-    r"\buniversity\b",
-    r"\bgovernment\b",
-    r"\breport(s|ed)?\b",
-    r"\bsource(s)?\b",
-    r"\bdata (shows|indicates|suggests)\b",
-]
-
-CAPS_THRESHOLD = 0.3
-
-
-def count_pattern_hits(text: str, patterns: list[str]) -> int:
-    text_l = text.lower()
-    return sum(1 for p in patterns if re.search(p, text_l))
+CAPS_THRESHOLD = 0.35
 
 
 def caps_ratio(text: str) -> float:
@@ -164,54 +244,15 @@ def caps_ratio(text: str) -> float:
     return sum(1 for c in alpha if c.isupper()) / len(alpha)
 
 
-def rule_based_scores(headline: str, body: Optional[str]) -> tuple[float, float, float]:
-    """Return (p_real, p_clickbait, p_fake) using weighted keyword scoring for more variance."""
-    full_text = headline + (" " + body[:600] if body else "")
-    headline_lower = headline.lower()
-    full_lower = full_text.lower()
-
-    # Weighted sums — vary naturally based on which/how-many signals fire
-    cb_weight = sum(score for p, _, score in CB_SCORED if re.search(p, headline_lower))
-    fake_weight = sum(score for p, _, score in FAKE_SCORED if re.search(p, full_lower))
-
-    # Structural signals
-    cr = caps_ratio(headline)
-    if cr > CAPS_THRESHOLD:
-        cb_weight += 60
-    if re.search(r"!!+", headline):
-        cb_weight += 55
-    elif re.search(r"!$", headline):
-        cb_weight += 30
-    if re.search(r"\?$", headline):
-        cb_weight += 20
-
-    credible_hits = count_pattern_hits(full_text, CREDIBLE_PHRASES)
-
-    # Convert weights to 0-1 (normalise against realistic max weights)
-    p_cb_raw = min(cb_weight / 260.0, 1.0)
-    p_fake_raw = min(fake_weight / 260.0, 1.0)
-
-    credibility_discount = min(credible_hits / 3.0, 1.0) * 0.35
-    p_fake_raw = max(0.0, p_fake_raw - credibility_discount)
-
-    p_cb = p_cb_raw * 0.85
-    p_fake = p_fake_raw * 0.80
-
-    credibility_boost = min(credible_hits / 4.0, 0.6)
-    p_real_raw = max(0.0, 1.0 - (p_cb + p_fake) * 0.5) * (0.5 + credibility_boost)
-
-    total = p_real_raw + p_cb + p_fake
-    if total < 0.01:
-        return 0.6, 0.2, 0.2
-    return p_real_raw / total, p_cb / total, p_fake / total
+def score_patterns(text: str, patterns: list[tuple[str, str | None, int]]) -> float:
+    """Sum severity scores for all matched patterns in text (case-insensitive)."""
+    text_l = text.lower()
+    return sum(score for p, _, score in patterns if re.search(p, text_l))
 
 
 def extract_keywords(headline: str, body: Optional[str]) -> list[KeywordMatch]:
-    """Return matched keywords with per-pattern severity scores, sorted highest first."""
-    full_text = headline + (" " + body[:600] if body else "")
+    """Return matched clickbait signals sorted by severity, highest first."""
     headline_lower = headline.lower()
-    full_lower = full_text.lower()
-
     found: list[KeywordMatch] = []
     seen: set[str] = set()
 
@@ -223,132 +264,145 @@ def extract_keywords(headline: str, body: Optional[str]) -> list[KeywordMatch]:
                 seen.add(word.lower())
                 found.append(KeywordMatch(word=word, score=score))
 
-    for pattern, label, score in FAKE_SCORED:
-        m = re.search(pattern, full_lower)
-        if m:
-            word = label if label else m.group(0).strip()
-            if word.lower() not in seen:
-                seen.add(word.lower())
-                found.append(KeywordMatch(word=word, score=score))
-
     # Structural meta-signals
-    if re.search(r"!!+", headline):
-        found.append(KeywordMatch(word="!!!", score=70))
-    elif re.search(r"!$", headline):
-        found.append(KeywordMatch(word="!", score=45))
-    if re.search(r"\?$", headline):
-        found.append(KeywordMatch(word="?", score=40))
-    if caps_ratio(headline) > CAPS_THRESHOLD:
-        found.append(KeywordMatch(word="ALL CAPS", score=75))
+    if re.search(r"!!+", headline) and "!!!" not in seen:
+        found.append(KeywordMatch(word="!!!", score=72))
+    elif re.search(r"!$", headline) and "!" not in seen:
+        found.append(KeywordMatch(word="!", score=42))
+    if re.search(r"\?$", headline) and "?" not in seen:
+        found.append(KeywordMatch(word="?", score=38))
+    if caps_ratio(headline) > CAPS_THRESHOLD and "ALL CAPS" not in seen:
+        found.append(KeywordMatch(word="ALL CAPS", score=72))
 
     found.sort(key=lambda k: k.score, reverse=True)
     return found[:12]
 
 
 def extract_indicators(
-    headline: str, body: Optional[str], p_cb: float, p_fake: float, model_label: Optional[str]
+    headline: str,
+    body: Optional[str],
+    p_cb: float,
+    p_real: float,
+    model_label: Optional[str],
 ) -> list[str]:
     indicators: list[str] = []
     h_lower = headline.lower()
-    if p_cb > 0.4:
+
+    if p_cb > 0.5:
         indicators.append("Sensational or emotionally-charged language detected")
-    if re.search(r"!{1,}$", headline):
-        indicators.append("Headline ends with exclamation mark(s)")
-    if re.search(r"\b\d+\s+(reasons|ways|things|facts|tips)\b", h_lower):
+    if re.search(r"!{2,}", headline):
+        indicators.append("Multiple exclamation marks detected")
+    elif re.search(r"!$", headline):
+        indicators.append("Headline ends with exclamation mark")
+    if re.search(r"\b\d+\s+(?:reasons?|ways?|things?|facts?|tips?|signs?)\b", h_lower):
         indicators.append("Listicle-style headline (numbered bait)")
     if caps_ratio(headline) > CAPS_THRESHOLD:
         indicators.append("Excessive capital letters")
-    if any(re.search(p, headline.lower()) for p, _, _ in FAKE_SCORED):
-        indicators.append("Conspiracy-related vocabulary detected")
-    if body and len(body.strip()) < 100:
-        indicators.append("Very short article body — limited factual context")
-    if count_pattern_hits(headline + (body or ""), CREDIBLE_PHRASES) >= 2:
-        indicators.append("Multiple credible-source references found")
-    if model_label == "FAKE":
-        indicators.append("BERT classifier: language matches known misinformation patterns")
+    # Check for top curiosity-gap patterns
+    curiosity_patterns = [p for p, _, _ in CB_SCORED[:10]]
+    if any(re.search(p, h_lower) for p in curiosity_patterns):
+        indicators.append("Curiosity-gap framing detected")
+    if re.search(r"\baccording to\b|\bstudy (?:shows?|finds?)\b|\bresearch\b|\bconfirmed\b", h_lower):
+        indicators.append("Attribution or research reference in headline")
+    if body:
+        body_lower = body.lower()
+        if re.search(r"\baccording to\b|\bstudy\b|\bresearch\b|\bofficial\b|\bconfirmed\b|\bspokesperson\b", body_lower):
+            indicators.append("Article body contains credible source citations")
+        if len(body.strip()) < 80:
+            indicators.append("Very short article body — limited factual context")
     if model_label == "REAL":
-        indicators.append("BERT classifier: language consistent with factual reporting")
-    return indicators if indicators else ["No strong signals detected — borderline content"]
+        indicators.append("Language model: consistent with factual reporting style")
+    elif model_label == "FAKE":
+        indicators.append("Language model: diverges from typical credible-reporting patterns")
+
+    return indicators if indicators else ["No strong signals detected — content appears neutral"]
 
 
-# ---------------------------------------------------------------------------
-# Label normalisation for HuggingFace model outputs
-# ---------------------------------------------------------------------------
 def normalise_label(raw_label: str) -> str:
-    """Map any HuggingFace label to FAKE|REAL."""
     u = raw_label.upper()
     if u in ("FAKE", "LABEL_0", "LABEL-0", "0"):
         return "FAKE"
     if u in ("REAL", "LABEL_1", "LABEL-1", "1", "TRUE"):
         return "REAL"
-    # hamzab/roberta-fake-news uses 0=FAKE 1=REAL too
     return "REAL"
 
 
-# ---------------------------------------------------------------------------
-# Core prediction
-# ---------------------------------------------------------------------------
 def predict(headline: str, body: Optional[str]) -> PredictResponse:
-    combined = headline + (" " + body[:400] if body else "")
+    combined = headline + (" " + body[:600] if body else "")
+    headline_lower = headline.lower()
 
+    # --- ML model credibility hint (0.0=not credible → 1.0=very credible) ---
     model_label: Optional[str] = None
-    model_conf: float = 0.5
+    ml_credibility: float = 0.5  # neutral default
 
     if classifier is not None:
         try:
             result = classifier(combined[:512])[0]
             model_label = normalise_label(result["label"])
-            model_conf = float(result["score"])
+            raw_conf = float(result["score"])
+            if model_label == "REAL":
+                # Model confident it's real → push credibility toward 1.0
+                ml_credibility = 0.5 + raw_conf * 0.45
+            else:
+                # Model says fake → lower credibility but don't override clickbait detection
+                ml_credibility = 0.5 - raw_conf * 0.35
         except Exception as exc:
             logger.warning(f"Inference error: {exc}")
 
-    # Rule-based scores (always computed)
-    p_real_rb, p_cb_rb, p_fake_rb = rule_based_scores(headline, body)
+    # --- Rule-based scoring ---
+    # Clickbait: headline weighted 100%, body weighted 25%
+    cb_hl = score_patterns(headline, CB_SCORED)
+    cb_body = score_patterns(body[:400] if body else "", CB_SCORED) * 0.25
+    cb_raw = cb_hl + cb_body
 
-    if model_label is not None:
-        if model_label == "FAKE":
-            p_fake_ml = model_conf
-            p_real_ml = 1.0 - model_conf
-        else:
-            p_real_ml = model_conf
-            p_fake_ml = 1.0 - model_conf
+    # Structural boosts for clickbait
+    if caps_ratio(headline) > CAPS_THRESHOLD:
+        cb_raw += 65
+    if re.search(r"!!+", headline):
+        cb_raw += 62
+    elif re.search(r"!$", headline):
+        cb_raw += 32
+    if re.search(r"\?$", headline):
+        cb_raw += 25
 
-        # Dynamic blend: more keyword evidence → more weight on rule-based scoring
-        # This creates genuine variance across headlines
-        combined_lower = combined.lower()
-        kw_weight = (
-            sum(score for p, _, score in CB_SCORED if re.search(p, combined_lower)) +
-            sum(score for p, _, score in FAKE_SCORED if re.search(p, combined_lower))
-        )
-        rb_ratio = min(0.30 + kw_weight / 700.0, 0.65)  # 0.30 (weak) → 0.65 (strong signals)
-        ml_ratio = 1.0 - rb_ratio
+    # Real/credibility: headline + body (body contributes 60%)
+    real_hl = score_patterns(headline, REAL_SCORED)
+    real_body = score_patterns(body[:600] if body else "", REAL_SCORED) * 0.6
+    real_raw = real_hl + real_body
 
-        p_real = ml_ratio * p_real_ml + rb_ratio * p_real_rb
-        p_fake = ml_ratio * p_fake_ml + rb_ratio * p_fake_rb
-        p_cb = rb_ratio * p_cb_rb
+    # Normalize: realistic max for heavy clickbait ~500, credible article ~450
+    p_cb_rule = min(cb_raw / 480.0, 1.0)
+    p_real_rule = min(real_raw / 420.0, 1.0)
 
-        total = p_real + p_fake + p_cb
-        if total > 0:
-            p_real /= total
-            p_fake /= total
-            p_cb /= total
+    # Blend with ML credibility hint
+    # ML adjusts real probability ±15 percentage points max
+    ml_adj = (ml_credibility - 0.5) * 0.30
+    p_real_adj = max(0.0, min(1.0, p_real_rule + ml_adj - p_cb_rule * 0.35))
+    p_cb_adj = max(0.0, p_cb_rule * (1.0 - ml_credibility * 0.28))
+
+    total = p_real_adj + p_cb_adj
+    if total < 0.01:
+        # No signals at all → lean real with moderate confidence
+        p_real_final = 0.72
+        p_cb_final = 0.28
     else:
-        p_real, p_cb, p_fake = p_real_rb, p_cb_rb, p_fake_rb
+        p_real_final = p_real_adj / total
+        p_cb_final = p_cb_adj / total
 
-    scores_map = {"REAL": p_real, "CLICKBAIT": p_cb, "FAKE": p_fake}
-    verdict = max(scores_map, key=lambda k: scores_map[k])
-    confidence = round(scores_map[verdict] * 100, 1)
+    verdict = "CLICKBAIT" if p_cb_final > 0.5 else "REAL"
+    raw_conf = p_cb_final if verdict == "CLICKBAIT" else p_real_final
+    # Clamp to realistic range — avoid 100% or 0%
+    confidence = round(max(42.0, min(97.0, raw_conf * 100)), 1)
 
-    indicators = extract_indicators(headline, body, p_cb, p_fake, model_label)
+    indicators = extract_indicators(headline, body, p_cb_final, p_real_final, model_label)
     keywords = extract_keywords(headline, body)
 
     return PredictResponse(
         verdict=verdict,
         confidence=confidence,
         scores={
-            "real": round(p_real * 100, 1),
-            "clickbait": round(p_cb * 100, 1),
-            "fake": round(p_fake * 100, 1),
+            "real": round(p_real_final * 100, 1),
+            "clickbait": round(p_cb_final * 100, 1),
         },
         indicators=indicators,
         keywords=keywords,
@@ -356,9 +410,6 @@ def predict(headline: str, body: Optional[str]) -> PredictResponse:
     )
 
 
-# ---------------------------------------------------------------------------
-# Routes
-# ---------------------------------------------------------------------------
 @app.post("/predict", response_model=PredictResponse)
 async def predict_route(req: PredictRequest):
     if not model_ready:

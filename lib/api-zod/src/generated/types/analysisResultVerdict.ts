@@ -15,5 +15,4 @@ export type AnalysisResultVerdict = typeof AnalysisResultVerdict[keyof typeof An
 export const AnalysisResultVerdict = {
   REAL: 'REAL',
   CLICKBAIT: 'CLICKBAIT',
-  FAKE: 'FAKE',
 } as const;

@@ -9,5 +9,4 @@
 export interface VerdictCounts {
   REAL: number;
   CLICKBAIT: number;
-  FAKE: number;
 }

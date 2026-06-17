@@ -35,7 +35,6 @@ export type AnalysisResultVerdict = typeof AnalysisResultVerdict[keyof typeof An
 export const AnalysisResultVerdict = {
   REAL: 'REAL',
   CLICKBAIT: 'CLICKBAIT',
-  FAKE: 'FAKE',
 } as const;
 
 export interface ScoreBreakdown {
@@ -43,8 +42,6 @@ export interface ScoreBreakdown {
   real: number;
   /** Probability score 0-100 for CLICKBAIT */
   clickbait: number;
-  /** Probability score 0-100 for FAKE */
-  fake: number;
 }
 
 export interface KeywordMatch {
@@ -69,7 +66,7 @@ export interface AnalysisResult {
   modelUsed: string;
   /** Text indicators that influenced the verdict */
   indicators?: string[];
-  /** Exact words or phrases found in the text that triggered the verdict, with per-keyword severity scores */
+  /** Clickbait signals found in the text with per-keyword severity scores */
   keywords?: KeywordMatch[];
 }
 
@@ -82,7 +79,6 @@ export type FeedbackInputCorrectLabel = typeof FeedbackInputCorrectLabel[keyof t
 export const FeedbackInputCorrectLabel = {
   REAL: 'REAL',
   CLICKBAIT: 'CLICKBAIT',
-  FAKE: 'FAKE',
 } as const;
 
 export interface FeedbackInput {
@@ -105,7 +101,6 @@ export type HistoryItemVerdict = typeof HistoryItemVerdict[keyof typeof HistoryI
 export const HistoryItemVerdict = {
   REAL: 'REAL',
   CLICKBAIT: 'CLICKBAIT',
-  FAKE: 'FAKE',
 } as const;
 
 export interface HistoryItem {
@@ -120,7 +115,6 @@ export interface HistoryItem {
 export interface VerdictCounts {
   REAL: number;
   CLICKBAIT: number;
-  FAKE: number;
 }
 
 export interface Stats {

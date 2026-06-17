@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { db, analysesTable, feedbackTable } from "@workspace/db";
-import { eq, desc, count, avg, sql } from "drizzle-orm";
+import { eq, desc, count, avg } from "drizzle-orm";
 import { AnalyzeNewsBody, SubmitFeedbackBody, GetHistoryQueryParams } from "@workspace/api-zod";
 import { logger } from "../lib/logger";
 
@@ -22,7 +22,7 @@ async function callMlService(headline: string, body?: string | null) {
   return res.json() as Promise<{
     verdict: string;
     confidence: number;
-    scores: { real: number; clickbait: number; fake: number };
+    scores: { real: number; clickbait: number };
     indicators: string[];
     keywords: { word: string; score: number }[];
     model_used: string;
@@ -57,7 +57,7 @@ router.post("/analyze", async (req, res) => {
         confidence: String(mlResult.confidence),
         scoreReal: String(mlResult.scores.real),
         scoreClickbait: String(mlResult.scores.clickbait),
-        scoreFake: String(mlResult.scores.fake),
+        scoreFake: "0",
         indicators: mlResult.indicators,
         modelUsed: mlResult.model_used,
       })
@@ -72,7 +72,6 @@ router.post("/analyze", async (req, res) => {
       scores: {
         real: Number(inserted.scoreReal),
         clickbait: Number(inserted.scoreClickbait),
-        fake: Number(inserted.scoreFake),
       },
       indicators: inserted.indicators,
       keywords: mlResult.keywords ?? [],
@@ -169,14 +168,15 @@ router.get("/stats", async (req, res) => {
       .from(analysesTable)
       .groupBy(analysesTable.verdict);
 
-    const verdictCounts = { REAL: 0, CLICKBAIT: 0, FAKE: 0 } as Record<string, number>;
+    const verdictCounts = { REAL: 0, CLICKBAIT: 0 } as Record<string, number>;
     for (const row of verdictRows) {
-      verdictCounts[row.verdict] = Number(row.cnt);
+      if (row.verdict === "REAL" || row.verdict === "CLICKBAIT") {
+        verdictCounts[row.verdict] = Number(row.cnt);
+      }
     }
 
     const [feedbackTotal] = await db.select({ total: count() }).from(feedbackTable);
 
-    // Calculate accuracy from feedback
     let accuracyFromFeedback: number | null = null;
     if (Number(feedbackTotal.total) >= 5) {
       const correctRows = await db
