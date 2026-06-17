@@ -3,13 +3,19 @@ info:
   # Do not change the title, if the title changes, the import paths will be broken
   title: Api
   version: 0.1.0
-  description: API specification
+  description: Fake News & Clickbait Detection API
 servers:
   - url: /api
     description: Base API path
 tags:
   - name: health
     description: Health operations
+  - name: analysis
+    description: News analysis operations
+  - name: feedback
+    description: User feedback and learning
+  - name: stats
+    description: Statistics and history
 paths:
   /healthz:
     get:
@@ -24,6 +30,116 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthStatus"
+
+  /analyze:
+    post:
+      operationId: analyzeNews
+      tags: [analysis]
+      summary: Analyze news for fake/clickbait
+      description: Submits a news headline and/or body for ML analysis
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NewsInput"
+      responses:
+        "200":
+          description: Analysis result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AnalysisResult"
+        "400":
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: ML service unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /feedback:
+    post:
+      operationId: submitFeedback
+      tags: [feedback]
+      summary: Submit labeled feedback for learning
+      description: User provides the correct label for an analysis to improve the model
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/FeedbackInput"
+      responses:
+        "201":
+          description: Feedback saved
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FeedbackResult"
+        "400":
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /history:
+    get:
+      operationId: getHistory
+      tags: [stats]
+      summary: Get recent analysis history
+      description: Returns the most recent analyses
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 20
+          description: Number of records to return
+      responses:
+        "200":
+          description: History list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/HistoryItem"
+
+  /stats:
+    get:
+      operationId: getStats
+      tags: [stats]
+      summary: Get aggregate statistics
+      description: Returns counts and distributions of past analyses
+      responses:
+        "200":
+          description: Statistics
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Stats"
+
+  /ml-status:
+    get:
+      operationId: getMlStatus
+      tags: [analysis]
+      summary: Get ML service status and model info
+      description: Returns whether the ML service is ready and which model is loaded
+      responses:
+        "200":
+          description: ML status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MlStatus"
+
 components:
   schemas:
     HealthStatus:
@@ -34,3 +150,181 @@ components:
       required:
         - status
 
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+      required:
+        - error
+
+    NewsInput:
+      type: object
+      required:
+        - headline
+      properties:
+        headline:
+          type: string
+          minLength: 3
+          description: The news headline to analyze
+        body:
+          type: ["string", "null"]
+          description: Optional full article body text
+
+    AnalysisResult:
+      type: object
+      required:
+        - id
+        - headline
+        - verdict
+        - confidence
+        - scores
+        - analyzedAt
+        - modelUsed
+      properties:
+        id:
+          type: integer
+        headline:
+          type: string
+        body:
+          type: ["string", "null"]
+        verdict:
+          type: string
+          enum: [REAL, CLICKBAIT, FAKE]
+          description: Final verdict
+        confidence:
+          type: number
+          description: Confidence score 0-100 for the verdict
+        scores:
+          $ref: "#/components/schemas/ScoreBreakdown"
+        analyzedAt:
+          type: string
+          description: ISO timestamp
+        modelUsed:
+          type: string
+        indicators:
+          type: array
+          items:
+            type: string
+          description: Text indicators that influenced the verdict
+
+    ScoreBreakdown:
+      type: object
+      required:
+        - real
+        - clickbait
+        - fake
+      properties:
+        real:
+          type: number
+          description: Probability score 0-100 for REAL
+        clickbait:
+          type: number
+          description: Probability score 0-100 for CLICKBAIT
+        fake:
+          type: number
+          description: Probability score 0-100 for FAKE
+
+    FeedbackInput:
+      type: object
+      required:
+        - analysisId
+        - correctLabel
+      properties:
+        analysisId:
+          type: integer
+          description: The ID of the analysis being corrected
+        correctLabel:
+          type: string
+          enum: [REAL, CLICKBAIT, FAKE]
+          description: The correct label according to the user
+
+    FeedbackResult:
+      type: object
+      required:
+        - id
+        - message
+        - totalFeedback
+      properties:
+        id:
+          type: integer
+        message:
+          type: string
+        totalFeedback:
+          type: integer
+          description: Total number of feedback items collected so far
+
+    HistoryItem:
+      type: object
+      required:
+        - id
+        - headline
+        - verdict
+        - confidence
+        - analyzedAt
+      properties:
+        id:
+          type: integer
+        headline:
+          type: string
+        verdict:
+          type: string
+          enum: [REAL, CLICKBAIT, FAKE]
+        confidence:
+          type: number
+        analyzedAt:
+          type: string
+        hasFeedback:
+          type: boolean
+
+    Stats:
+      type: object
+      required:
+        - totalAnalyzed
+        - verdictCounts
+        - avgConfidence
+        - totalFeedback
+        - accuracyFromFeedback
+      properties:
+        totalAnalyzed:
+          type: integer
+        verdictCounts:
+          $ref: "#/components/schemas/VerdictCounts"
+        avgConfidence:
+          type: number
+        totalFeedback:
+          type: integer
+        accuracyFromFeedback:
+          type: ["number", "null"]
+          description: Model accuracy estimated from user feedback (null if not enough data)
+
+    VerdictCounts:
+      type: object
+      required:
+        - REAL
+        - CLICKBAIT
+        - FAKE
+      properties:
+        REAL:
+          type: integer
+        CLICKBAIT:
+          type: integer
+        FAKE:
+          type: integer
+
+    MlStatus:
+      type: object
+      required:
+        - ready
+        - modelName
+        - feedbackCount
+        - lastRetrained
+      properties:
+        ready:
+          type: boolean
+        modelName:
+          type: string
+        feedbackCount:
+          type: integer
+        lastRetrained:
+          type: ["string", "null"]
