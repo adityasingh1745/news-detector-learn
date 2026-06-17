@@ -3,10 +3,8 @@ import { useQueryClient } from "@tanstack/react-query";
 import {
   useAnalyzeNews,
   useSubmitFeedback,
-  useGetHistory,
   useGetStats,
   useGetMlStatus,
-  getGetHistoryQueryKey,
   getGetStatsQueryKey,
   getGetMlStatusQueryKey,
 } from "@workspace/api-client-react";
@@ -18,7 +16,7 @@ import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Activity, AlertTriangle, CheckCircle2, History, Database, Shield, Zap, Search, ChevronRight, RotateCcw } from "lucide-react";
+import { Activity, AlertTriangle, CheckCircle2, Database, Shield, Zap, Search, ChevronRight, RotateCcw } from "lucide-react";
 import { format } from "date-fns";
 
 type VerdictType = "REAL" | "CLICKBAIT" | "FAKE";
@@ -46,21 +44,15 @@ export default function Home() {
   const [headline, setHeadline] = useState("");
   const [body, setBody] = useState("");
   const [currentResultId, setCurrentResultId] = useState<number | null>(null);
+  const [feedbackSubmitted, setFeedbackSubmitted] = useState(false);
 
   // Queries
   const { data: mlStatus } = useGetMlStatus({
     query: {
       queryKey: getGetMlStatusQueryKey(),
-      refetchInterval: (query) => {
-        return query.state.data?.ready ? false : 5000;
-      },
+      refetchInterval: (query) => (query.state.data?.ready ? false : 5000),
     },
   });
-
-  const { data: history, isLoading: historyLoading } = useGetHistory(
-    { limit: 10 },
-    { query: { queryKey: getGetHistoryQueryKey({ limit: 10 }) } }
-  );
 
   const { data: stats, isLoading: statsLoading } = useGetStats({
     query: { queryKey: getGetStatsQueryKey() },
@@ -70,7 +62,6 @@ export default function Home() {
   const analyzeNews = useAnalyzeNews({
     mutation: {
       onSuccess: () => {
-        queryClient.invalidateQueries({ queryKey: getGetHistoryQueryKey() });
         queryClient.invalidateQueries({ queryKey: getGetStatsQueryKey() });
       },
     },
@@ -79,7 +70,7 @@ export default function Home() {
   const submitFeedback = useSubmitFeedback({
     mutation: {
       onSuccess: () => {
-        queryClient.invalidateQueries({ queryKey: getGetHistoryQueryKey() });
+        setFeedbackSubmitted(true);
         queryClient.invalidateQueries({ queryKey: getGetStatsQueryKey() });
         queryClient.invalidateQueries({ queryKey: getGetMlStatusQueryKey() });
       },
@@ -89,32 +80,26 @@ export default function Home() {
   const handleAnalyze = (e: React.FormEvent) => {
     e.preventDefault();
     if (!headline.trim()) return;
-
+    setFeedbackSubmitted(false);
     analyzeNews.mutate(
       { data: { headline, body: body.trim() || undefined } },
-      {
-        onSuccess: (data) => {
-          setCurrentResultId(data.id);
-        },
-      }
+      { onSuccess: (data) => setCurrentResultId(data.id) }
     );
   };
 
   const handleFeedback = (verdict: VerdictType) => {
     if (!currentResultId) return;
-    submitFeedback.mutate({
-      data: { analysisId: currentResultId, correctLabel: verdict },
-    });
+    submitFeedback.mutate({ data: { analysisId: currentResultId, correctLabel: verdict } });
   };
 
   const handleReset = () => {
     setHeadline("");
     setBody("");
     setCurrentResultId(null);
+    setFeedbackSubmitted(false);
     analyzeNews.reset();
   };
 
-  const currentResult = history?.find((h) => h.id === currentResultId);
   const currentResultFullData = analyzeNews.data?.id === currentResultId ? analyzeNews.data : null;
 
   const isAnalyzing = analyzeNews.isPending;
@@ -193,19 +178,17 @@ export default function Home() {
                   />
                 </div>
                 <div className="flex gap-3 justify-end pt-2">
-                  {(headline || body || currentResultFullData) && (
-                    <Button
-                      type="button"
-                      variant="outline"
-                      onClick={handleReset}
-                      disabled={isAnalyzing}
-                      className="font-mono w-full md:w-auto"
-                      data-testid="button-reset"
-                    >
-                      <RotateCcw className="w-4 h-4 mr-2" />
-                      RESET
-                    </Button>
-                  )}
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={handleReset}
+                    disabled={isAnalyzing}
+                    className="font-mono w-full md:w-auto"
+                    data-testid="button-reset"
+                  >
+                    <RotateCcw className="w-4 h-4 mr-2" />
+                    CLEAR
+                  </Button>
                   <Button 
                     type="submit" 
                     disabled={!headline.trim() || isAnalyzing || !modelReady}
@@ -357,7 +340,7 @@ export default function Home() {
               </Card>
 
               {/* Feedback Section */}
-              {(!currentResult || !currentResult.hasFeedback) && (
+              {!feedbackSubmitted && (
                 <Card className="border-primary/20 bg-primary/5">
                   <CardContent className="p-6 flex flex-col sm:flex-row items-center justify-between gap-6">
                     <div className="space-y-1 text-center sm:text-left">
@@ -442,75 +425,8 @@ export default function Home() {
                     </div>
                   </div>
 
-                  <div className="pt-4 border-t border-border/50 grid grid-cols-2 gap-4">
-                    <div className="space-y-1">
-                      <div className="text-[10px] font-mono text-muted-foreground uppercase">Training Samples</div>
-                      <div className="text-lg font-mono text-muted-foreground" data-testid="stat-feedback">{stats.totalFeedback.toLocaleString()}</div>
-                    </div>
-                    <div className="space-y-1">
-                      <div className="text-[10px] font-mono text-muted-foreground uppercase">Calibrated Acc</div>
-                      <div className="text-lg font-mono text-muted-foreground" data-testid="stat-accuracy">
-                        {stats.accuracyFromFeedback ? `${stats.accuracyFromFeedback.toFixed(1)}%` : "N/A"}
-                      </div>
-                    </div>
-                  </div>
                 </>
               ) : null}
-            </CardContent>
-          </Card>
-
-          <Card className="border-border/50 bg-card/30">
-            <CardHeader className="pb-4">
-              <CardTitle className="font-mono text-sm flex items-center gap-2 text-muted-foreground">
-                <History className="w-4 h-4" />
-                RECENT_SCANS
-              </CardTitle>
-            </CardHeader>
-            <CardContent>
-              {historyLoading ? (
-                <div className="space-y-3">
-                  <Skeleton className="h-12 w-full" />
-                  <Skeleton className="h-12 w-full" />
-                  <Skeleton className="h-12 w-full" />
-                </div>
-              ) : history && history.length > 0 ? (
-                <div className="space-y-3">
-                  {history.map((item) => (
-                    <div 
-                      key={item.id} 
-                      className={`p-3 rounded border border-border/30 bg-background/50 flex flex-col gap-2 transition-colors cursor-pointer hover:border-primary/50 ${currentResultId === item.id ? 'ring-1 ring-primary border-primary' : ''}`}
-                      onClick={() => setCurrentResultId(item.id)}
-                      data-testid={`history-item-${item.id}`}
-                    >
-                      <div className="flex items-center justify-between gap-2">
-                        <Badge variant="outline" className={`text-[10px] py-0 px-2 font-mono border ${getVerdictClasses(item.verdict)}`}>
-                          {item.verdict}
-                        </Badge>
-                        <span className="text-[10px] font-mono text-muted-foreground">
-                          {format(new Date(item.analyzedAt), "HH:mm")}
-                        </span>
-                      </div>
-                      <div className="text-sm font-medium line-clamp-2 leading-snug">
-                        {item.headline}
-                      </div>
-                      <div className="flex items-center gap-2 text-xs font-mono">
-                        <span className={getVerdictColor(item.verdict)}>
-                          {item.confidence.toFixed(1)}% CONF
-                        </span>
-                        {item.hasFeedback && (
-                          <span className="text-muted-foreground flex items-center gap-1">
-                            <span className="w-1 h-1 rounded-full bg-primary" /> VERIFIED
-                          </span>
-                        )}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <div className="text-center py-8 text-sm font-mono text-muted-foreground">
-                  NO_DATA_FOUND
-                </div>
-              )}
             </CardContent>
           </Card>
 

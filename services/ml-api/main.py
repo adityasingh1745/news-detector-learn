@@ -98,45 +98,40 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 # Rule-based feature extraction
 # ---------------------------------------------------------------------------
-CLICKBAIT_PHRASES = [
-    r"\byou won'?t believe\b",
-    r"\bshock(ing|ed|s)?\b",
-    r"\bwhat happen(s|ed) next\b",
-    r"\bwill blow your mind\b",
-    r"\bthis is why\b",
-    r"\bsecret(ly|s)?\b",
-    r"\b(amazing|incredible|unbelievable|stunning)\b",
-    r"\bexclusive\b",
-    r"\b(must.?see|must.?read|must.?watch)\b",
-    r"\bviral\b",
-    r"\b\d+\s+(reasons|ways|things|facts|secrets|tips)\b",
-    r"\bhow to\b.*\b(instantly|immediately|overnight|fast)\b",
-    r"!{1,}$",
-    r"!!+",
-    r"\?$",
-    r"\bOMG\b",
-    r"\bWOW\b",
+# (pattern, display_label, severity_score)
+CB_SCORED: list[tuple[str, str, int]] = [
+    (r"you won'?t believe",        "you won't believe",    92),
+    (r"will blow your mind",        "will blow your mind",  95),
+    (r"what happens? next",         "what happens next",    72),
+    (r"must.?(?:see|read|watch)",   "must-see/read/watch",  75),
+    (r"how to\b.{0,40}(?:instantly|immediately|overnight|fast)", "how to ... instantly", 72),
+    (r"\d+\s+(?:reasons|ways|things|facts|secrets|tips)", None, 80),  # None = use matched text
+    (r"shock(?:ing|ed|s)?",         None,                   78),
+    (r"unbelievable|incredible",    None,                   74),
+    (r"amazing|stunning",           None,                   65),
+    (r"\bOMG\b",                    "OMG",                  85),
+    (r"\bWOW\b",                    "WOW",                  80),
+    (r"\bexclusive\b",              "exclusive",            60),
+    (r"\bviral\b",                  "viral",                65),
+    (r"secret(?:ly|s)?",            None,                   55),
 ]
 
-FAKE_NEWS_PHRASES = [
-    r"\bsecret agenda\b",
-    r"\bdeep state\b",
-    r"\bthey don'?t want you to know\b",
-    r"\bmain ?stream media\b.*\b(lie|hiding|cover.?up)\b",
-    r"\bwake up\b",
-    r"\bsheep\b",
-    r"\bhoax\b",
-    r"\bscam\b",
-    r"\bconspiracy\b",
-    r"\bpedogate\b",
-    r"\bfake\b",
-    r"\bpropaganda\b",
-    r"\billegit(imate)?\b",
-    r"\bfraud\b",
-    r"\bstolen\b.*\belection\b",
-    r"\bmisinformation\b",
-    r"\bsuppressed\b",
-    r"\bwhistleblow\b",
+FAKE_SCORED: list[tuple[str, str, int]] = [
+    (r"they don'?t want you to know", "they don't want you to know", 95),
+    (r"stolen\s+election",          "stolen election",      95),
+    (r"deep state",                 "deep state",           92),
+    (r"\bhoax\b",                   "hoax",                 90),
+    (r"secret agenda",              "secret agenda",        88),
+    (r"\bconspiracy\b",             "conspiracy",           85),
+    (r"\bscam\b",                   "scam",                 82),
+    (r"\bsuppressed\b",             "suppressed",           82),
+    (r"\bpropaganda\b",             "propaganda",           80),
+    (r"\bfraud\b",                  "fraud",                78),
+    (r"\bmisinformation\b",         "misinformation",       75),
+    (r"whistleblow\w*",             None,                   65),
+    (r"\bwake up\b",                "wake up",              62),
+    (r"mainstream media\b.{0,30}(?:lie|hid|cover)",  "mainstream media lies", 85),
+    (r"\bpedogate\b",               "pedogate",             95),
 ]
 
 CREDIBLE_PHRASES = [
@@ -170,103 +165,82 @@ def caps_ratio(text: str) -> float:
 
 
 def rule_based_scores(headline: str, body: Optional[str]) -> tuple[float, float, float]:
-    """Return (p_real, p_clickbait, p_fake) as 0-1 probabilities."""
+    """Return (p_real, p_clickbait, p_fake) using weighted keyword scoring for more variance."""
     full_text = headline + (" " + body[:600] if body else "")
+    headline_lower = headline.lower()
+    full_lower = full_text.lower()
 
-    cb_hits = count_pattern_hits(headline, CLICKBAIT_PHRASES)
-    fake_hits = count_pattern_hits(full_text, FAKE_NEWS_PHRASES)
-    credible_hits = count_pattern_hits(full_text, CREDIBLE_PHRASES)
+    # Weighted sums — vary naturally based on which/how-many signals fire
+    cb_weight = sum(score for p, _, score in CB_SCORED if re.search(p, headline_lower))
+    fake_weight = sum(score for p, _, score in FAKE_SCORED if re.search(p, full_lower))
+
+    # Structural signals
     cr = caps_ratio(headline)
-    has_excl = bool(re.search(r"!{1,}$", headline))
-    has_question = bool(re.search(r"\?$", headline))
-    listicle = bool(re.search(r"\b\d+\s+(reasons|ways|things|facts|tips)\b", headline.lower()))
-    if has_excl:
-        cb_hits += 1
-    if listicle:
-        cb_hits += 1
     if cr > CAPS_THRESHOLD:
-        cb_hits += 2
+        cb_weight += 60
+    if re.search(r"!!+", headline):
+        cb_weight += 55
+    elif re.search(r"!$", headline):
+        cb_weight += 30
+    if re.search(r"\?$", headline):
+        cb_weight += 20
 
-    # Score clickbait
-    p_cb = min(cb_hits / 5.0, 1.0) * 0.85
+    credible_hits = count_pattern_hits(full_text, CREDIBLE_PHRASES)
 
-    # Score fake
-    fake_raw = min(fake_hits / 4.0, 1.0)
-    credibility_discount = min(credible_hits / 3.0, 1.0) * 0.4
-    p_fake = max(0.0, fake_raw - credibility_discount) * 0.80
+    # Convert weights to 0-1 (normalise against realistic max weights)
+    p_cb_raw = min(cb_weight / 260.0, 1.0)
+    p_fake_raw = min(fake_weight / 260.0, 1.0)
 
-    # Real score — inversely proportional to cb+fake, boosted by credible phrases
+    credibility_discount = min(credible_hits / 3.0, 1.0) * 0.35
+    p_fake_raw = max(0.0, p_fake_raw - credibility_discount)
+
+    p_cb = p_cb_raw * 0.85
+    p_fake = p_fake_raw * 0.80
+
     credibility_boost = min(credible_hits / 4.0, 0.6)
     p_real_raw = max(0.0, 1.0 - (p_cb + p_fake) * 0.5) * (0.5 + credibility_boost)
 
-    # Normalise
     total = p_real_raw + p_cb + p_fake
     if total < 0.01:
         return 0.6, 0.2, 0.2
     return p_real_raw / total, p_cb / total, p_fake / total
 
 
-# (pattern, score) — score is 0-100 severity for this signal
-KEYWORD_PATTERNS: list[tuple[str, int]] = [
-    # --- Clickbait ---
-    (r"you won'?t believe",        92),
-    (r"will blow your mind",       95),
-    (r"what happens? next",        72),
-    (r"must.?(?:see|read|watch)",  75),
-    (r"how to\b.{0,40}(?:instantly|immediately|overnight|fast)", 72),
-    (r"\d+\s+(?:reasons|ways|things|facts|secrets|tips)",        80),
-    (r"shock(?:ing|ed|s)?",        78),
-    (r"unbelievable|incredible",   74),
-    (r"amazing|stunning",          65),
-    (r"\bOMG\b",                   85),
-    (r"\bWOW\b",                   80),
-    (r"exclusive",                 60),
-    (r"viral",                     65),
-    (r"secret(?:ly|s)?",           55),
-    # --- Fake news ---
-    (r"they don'?t want you to know", 95),
-    (r"stolen\s+election",         95),
-    (r"deep state",                92),
-    (r"hoax",                      90),
-    (r"secret agenda",             88),
-    (r"conspiracy",                85),
-    (r"scam",                      82),
-    (r"suppressed",                82),
-    (r"propaganda",                80),
-    (r"fraud",                     78),
-    (r"misinformation",            75),
-    (r"whistleblow\w*",            65),
-    (r"wake up",                   62),
-]
-
-
 def extract_keywords(headline: str, body: Optional[str]) -> list[KeywordMatch]:
-    """Return matched words/phrases with per-pattern severity scores."""
+    """Return matched keywords with per-pattern severity scores, sorted highest first."""
     full_text = headline + (" " + body[:600] if body else "")
+    headline_lower = headline.lower()
     full_lower = full_text.lower()
 
     found: list[KeywordMatch] = []
     seen: set[str] = set()
 
-    for pattern, score in KEYWORD_PATTERNS:
+    for pattern, label, score in CB_SCORED:
+        m = re.search(pattern, headline_lower)
+        if m:
+            word = label if label else m.group(0).strip()
+            if word.lower() not in seen:
+                seen.add(word.lower())
+                found.append(KeywordMatch(word=word, score=score))
+
+    for pattern, label, score in FAKE_SCORED:
         m = re.search(pattern, full_lower)
         if m:
-            kw = m.group(0).strip()
-            if kw and kw.lower() not in seen:
-                seen.add(kw.lower())
-                found.append(KeywordMatch(word=kw, score=score))
+            word = label if label else m.group(0).strip()
+            if word.lower() not in seen:
+                seen.add(word.lower())
+                found.append(KeywordMatch(word=word, score=score))
 
-    # Meta signals with their own scores
+    # Structural meta-signals
     if re.search(r"!!+", headline):
-        found.append(KeywordMatch(word="!!! multiple exclamation marks", score=70))
+        found.append(KeywordMatch(word="!!!", score=70))
     elif re.search(r"!$", headline):
-        found.append(KeywordMatch(word="! exclamation mark", score=45))
+        found.append(KeywordMatch(word="!", score=45))
     if re.search(r"\?$", headline):
-        found.append(KeywordMatch(word="? question headline", score=40))
+        found.append(KeywordMatch(word="?", score=40))
     if caps_ratio(headline) > CAPS_THRESHOLD:
         found.append(KeywordMatch(word="ALL CAPS", score=75))
 
-    # Sort by score descending, cap at 12
     found.sort(key=lambda k: k.score, reverse=True)
     return found[:12]
 
@@ -284,7 +258,7 @@ def extract_indicators(
         indicators.append("Listicle-style headline (numbered bait)")
     if caps_ratio(headline) > CAPS_THRESHOLD:
         indicators.append("Excessive capital letters")
-    if count_pattern_hits(headline, FAKE_NEWS_PHRASES) > 0:
+    if any(re.search(p, headline.lower()) for p, _, _ in FAKE_SCORED):
         indicators.append("Conspiracy-related vocabulary detected")
     if body and len(body.strip()) < 100:
         indicators.append("Very short article body — limited factual context")
@@ -332,7 +306,6 @@ def predict(headline: str, body: Optional[str]) -> PredictResponse:
     p_real_rb, p_cb_rb, p_fake_rb = rule_based_scores(headline, body)
 
     if model_label is not None:
-        # Blend: 60% ML model, 40% rule-based
         if model_label == "FAKE":
             p_fake_ml = model_conf
             p_real_ml = 1.0 - model_conf
@@ -340,10 +313,19 @@ def predict(headline: str, body: Optional[str]) -> PredictResponse:
             p_real_ml = model_conf
             p_fake_ml = 1.0 - model_conf
 
-        # Distribute residual ML probability between fake and real proportionally
-        p_real = 0.6 * p_real_ml + 0.4 * p_real_rb
-        p_fake = 0.6 * p_fake_ml + 0.4 * p_fake_rb
-        p_cb = 0.4 * p_cb_rb  # clickbait purely rule-based
+        # Dynamic blend: more keyword evidence → more weight on rule-based scoring
+        # This creates genuine variance across headlines
+        combined_lower = combined.lower()
+        kw_weight = (
+            sum(score for p, _, score in CB_SCORED if re.search(p, combined_lower)) +
+            sum(score for p, _, score in FAKE_SCORED if re.search(p, combined_lower))
+        )
+        rb_ratio = min(0.30 + kw_weight / 700.0, 0.65)  # 0.30 (weak) → 0.65 (strong signals)
+        ml_ratio = 1.0 - rb_ratio
+
+        p_real = ml_ratio * p_real_ml + rb_ratio * p_real_rb
+        p_fake = ml_ratio * p_fake_ml + rb_ratio * p_fake_rb
+        p_cb = rb_ratio * p_cb_rb
 
         total = p_real + p_fake + p_cb
         if total > 0:
