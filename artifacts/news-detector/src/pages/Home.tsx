@@ -18,7 +18,7 @@ import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Activity, AlertTriangle, CheckCircle2, History, Database, Shield, Zap, Search, ChevronRight } from "lucide-react";
+import { Activity, AlertTriangle, CheckCircle2, History, Database, Shield, Zap, Search, ChevronRight, RotateCcw } from "lucide-react";
 import { format } from "date-fns";
 
 type VerdictType = "REAL" | "CLICKBAIT" | "FAKE";
@@ -107,6 +107,13 @@ export default function Home() {
     });
   };
 
+  const handleReset = () => {
+    setHeadline("");
+    setBody("");
+    setCurrentResultId(null);
+    analyzeNews.reset();
+  };
+
   const currentResult = history?.find((h) => h.id === currentResultId);
   const currentResultFullData = analyzeNews.data?.id === currentResultId ? analyzeNews.data : null;
 
@@ -185,7 +192,20 @@ export default function Home() {
                     data-testid="input-body"
                   />
                 </div>
-                <div className="flex justify-end pt-2">
+                <div className="flex gap-3 justify-end pt-2">
+                  {(headline || body || currentResultFullData) && (
+                    <Button
+                      type="button"
+                      variant="outline"
+                      onClick={handleReset}
+                      disabled={isAnalyzing}
+                      className="font-mono w-full md:w-auto"
+                      data-testid="button-reset"
+                    >
+                      <RotateCcw className="w-4 h-4 mr-2" />
+                      RESET
+                    </Button>
+                  )}
                   <Button 
                     type="submit" 
                     disabled={!headline.trim() || isAnalyzing || !modelReady}
@@ -370,15 +390,9 @@ export default function Home() {
                 </div>
               ) : stats ? (
                 <>
-                  <div className="grid grid-cols-2 gap-4">
-                    <div className="space-y-1">
-                      <div className="text-[10px] font-mono text-muted-foreground uppercase">Total Scans</div>
-                      <div className="text-2xl font-mono" data-testid="stat-total">{stats.totalAnalyzed.toLocaleString()}</div>
-                    </div>
-                    <div className="space-y-1">
-                      <div className="text-[10px] font-mono text-muted-foreground uppercase">Avg Confidence</div>
-                      <div className="text-2xl font-mono text-primary" data-testid="stat-confidence">{stats.avgConfidence.toFixed(1)}%</div>
-                    </div>
+                  <div className="space-y-1">
+                    <div className="text-[10px] font-mono text-muted-foreground uppercase">Avg Confidence</div>
+                    <div className="text-2xl font-mono text-primary" data-testid="stat-confidence">{stats.avgConfidence.toFixed(1)}%</div>
                   </div>
 
                   <div className="space-y-2">
