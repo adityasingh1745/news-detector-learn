@@ -47,6 +47,13 @@ export interface ScoreBreakdown {
   fake: number;
 }
 
+export interface KeywordMatch {
+  /** The exact word or phrase matched in the text */
+  word: string;
+  /** Severity score 0-100 for this specific keyword signal */
+  score: number;
+}
+
 export interface AnalysisResult {
   id: number;
   headline: string;
@@ -62,8 +69,8 @@ export interface AnalysisResult {
   modelUsed: string;
   /** Text indicators that influenced the verdict */
   indicators?: string[];
-  /** Exact words or phrases found in the text that triggered the verdict */
-  keywords?: string[];
+  /** Exact words or phrases found in the text that triggered the verdict, with per-keyword severity scores */
+  keywords?: KeywordMatch[];
 }
 
 /**

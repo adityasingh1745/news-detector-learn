@@ -6,6 +6,7 @@
  * OpenAPI spec version: 0.1.0
  */
 import type { AnalysisResultVerdict } from './analysisResultVerdict';
+import type { KeywordMatch } from './keywordMatch';
 import type { ScoreBreakdown } from './scoreBreakdown';
 
 export interface AnalysisResult {
@@ -23,6 +24,6 @@ export interface AnalysisResult {
   modelUsed: string;
   /** Text indicators that influenced the verdict */
   indicators?: string[];
-  /** Exact words or phrases found in the text that triggered the verdict */
-  keywords?: string[];
+  /** Exact words or phrases found in the text that triggered the verdict, with per-keyword severity scores */
+  keywords?: KeywordMatch[];
 }

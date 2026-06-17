@@ -28,12 +28,16 @@ class PredictRequest(BaseModel):
     headline: str
     body: Optional[str] = None
 
+class KeywordMatch(BaseModel):
+    word: str
+    score: int  # 0-100 severity for this specific signal
+
 class PredictResponse(BaseModel):
     verdict: str
     confidence: float
     scores: dict
     indicators: list[str]
-    keywords: list[str]
+    keywords: list[KeywordMatch]
     model_used: str
 
 class StatusResponse(BaseModel):
@@ -202,73 +206,68 @@ def rule_based_scores(headline: str, body: Optional[str]) -> tuple[float, float,
     return p_real_raw / total, p_cb / total, p_fake / total
 
 
-def extract_keywords(headline: str, body: Optional[str]) -> list[str]:
-    """Return the actual words/phrases from the text that matched suspicious patterns."""
+# (pattern, score) — score is 0-100 severity for this signal
+KEYWORD_PATTERNS: list[tuple[str, int]] = [
+    # --- Clickbait ---
+    (r"you won'?t believe",        92),
+    (r"will blow your mind",       95),
+    (r"what happens? next",        72),
+    (r"must.?(?:see|read|watch)",  75),
+    (r"how to\b.{0,40}(?:instantly|immediately|overnight|fast)", 72),
+    (r"\d+\s+(?:reasons|ways|things|facts|secrets|tips)",        80),
+    (r"shock(?:ing|ed|s)?",        78),
+    (r"unbelievable|incredible",   74),
+    (r"amazing|stunning",          65),
+    (r"\bOMG\b",                   85),
+    (r"\bWOW\b",                   80),
+    (r"exclusive",                 60),
+    (r"viral",                     65),
+    (r"secret(?:ly|s)?",           55),
+    # --- Fake news ---
+    (r"they don'?t want you to know", 95),
+    (r"stolen\s+election",         95),
+    (r"deep state",                92),
+    (r"hoax",                      90),
+    (r"secret agenda",             88),
+    (r"conspiracy",                85),
+    (r"scam",                      82),
+    (r"suppressed",                82),
+    (r"propaganda",                80),
+    (r"fraud",                     78),
+    (r"misinformation",            75),
+    (r"whistleblow\w*",            65),
+    (r"wake up",                   62),
+]
+
+
+def extract_keywords(headline: str, body: Optional[str]) -> list[KeywordMatch]:
+    """Return matched words/phrases with per-pattern severity scores."""
     full_text = headline + (" " + body[:600] if body else "")
-    headline_lower = headline.lower()
     full_lower = full_text.lower()
 
-    found: list[str] = []
+    found: list[KeywordMatch] = []
     seen: set[str] = set()
 
-    # Word/phrase patterns — return the matched text directly
-    word_patterns = [
-        # clickbait
-        r"you won'?t believe",
-        r"shock(?:ing|ed|s)?",
-        r"what happens? next",
-        r"will blow your mind",
-        r"secret(?:ly|s)?",
-        r"amazing|incredible|unbelievable|stunning",
-        r"exclusive",
-        r"must.?(?:see|read|watch)",
-        r"viral",
-        r"\d+\s+(?:reasons|ways|things|facts|secrets|tips)",
-        r"how to\b.{0,40}(?:instantly|immediately|overnight|fast)",
-        r"\bOMG\b",
-        r"\bWOW\b",
-        # fake news
-        r"secret agenda",
-        r"deep state",
-        r"they don'?t want you to know",
-        r"wake up",
-        r"hoax",
-        r"scam",
-        r"conspiracy",
-        r"propaganda",
-        r"fraud",
-        r"stolen\s+election",
-        r"misinformation",
-        r"suppressed",
-        r"whistleblow\w*",
-    ]
-
-    for pattern in word_patterns:
+    for pattern, score in KEYWORD_PATTERNS:
         m = re.search(pattern, full_lower)
         if m:
             kw = m.group(0).strip()
             if kw and kw.lower() not in seen:
                 seen.add(kw.lower())
-                found.append(kw)
+                found.append(KeywordMatch(word=kw, score=score))
 
-    # Listicle pattern — extract the full match like "5 reasons"
-    m = re.search(r"\d+\s+(?:reasons|ways|things|facts|tips)", headline_lower)
-    if m:
-        kw = m.group(0).strip()
-        if kw.lower() not in seen:
-            seen.add(kw.lower())
-            found.append(kw)
-
-    # Meta signals
+    # Meta signals with their own scores
     if re.search(r"!!+", headline):
-        found.append("!!! (multiple exclamation marks)")
+        found.append(KeywordMatch(word="!!! multiple exclamation marks", score=70))
     elif re.search(r"!$", headline):
-        found.append("! (exclamation mark)")
+        found.append(KeywordMatch(word="! exclamation mark", score=45))
     if re.search(r"\?$", headline):
-        found.append("? (question headline)")
+        found.append(KeywordMatch(word="? question headline", score=40))
     if caps_ratio(headline) > CAPS_THRESHOLD:
-        found.append("ALL CAPS")
+        found.append(KeywordMatch(word="ALL CAPS", score=75))
 
+    # Sort by score descending, cap at 12
+    found.sort(key=lambda k: k.score, reverse=True)
     return found[:12]
 
 

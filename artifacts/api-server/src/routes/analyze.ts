@@ -24,7 +24,7 @@ async function callMlService(headline: string, body?: string | null) {
     confidence: number;
     scores: { real: number; clickbait: number; fake: number };
     indicators: string[];
-    keywords: string[];
+    keywords: { word: string; score: number }[];
     model_used: string;
   }>;
 }

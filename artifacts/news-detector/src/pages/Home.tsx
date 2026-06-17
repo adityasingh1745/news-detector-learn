@@ -315,18 +315,26 @@ export default function Home() {
                         TRIGGER_KEYWORDS
                       </h4>
                       <div className="flex flex-wrap gap-2">
-                        {currentResultFullData.keywords.map((kw, i) => (
-                          <span
-                            key={i}
-                            className={`inline-flex items-center px-2.5 py-1 rounded text-xs font-mono font-semibold border ${
-                              currentResultFullData.verdict === "CLICKBAIT"
-                                ? "bg-amber-500/10 border-amber-500/40 text-amber-400"
-                                : "bg-rose-500/10 border-rose-500/40 text-rose-400"
-                            }`}
-                          >
-                            {kw}
-                          </span>
-                        ))}
+                        {currentResultFullData.keywords.map((kw, i) => {
+                          const isClickbait = currentResultFullData.verdict === "CLICKBAIT";
+                          const chipColor = isClickbait
+                            ? "bg-amber-500/10 border-amber-500/40 text-amber-400"
+                            : "bg-rose-500/10 border-rose-500/40 text-rose-400";
+                          const badgeColor = isClickbait
+                            ? "bg-amber-500/25 text-amber-300"
+                            : "bg-rose-500/25 text-rose-300";
+                          return (
+                            <span
+                              key={i}
+                              className={`inline-flex items-center gap-1.5 pl-2.5 pr-1.5 py-1 rounded text-xs font-mono font-semibold border ${chipColor}`}
+                            >
+                              {kw.word}
+                              <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-bold ${badgeColor}`}>
+                                {kw.score}%
+                              </span>
+                            </span>
+                          );
+                        })}
                       </div>
                     </div>
                   )}

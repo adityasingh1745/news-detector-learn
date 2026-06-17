@@ -16,6 +16,7 @@ export * from './getHistoryParams';
 export * from './healthStatus';
 export * from './historyItem';
 export * from './historyItemVerdict';
+export * from './keywordMatch';
 export * from './mlStatus';
 export * from './newsInput';
 export * from './scoreBreakdown';

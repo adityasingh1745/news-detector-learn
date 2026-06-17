@@ -44,7 +44,10 @@ export const AnalyzeNewsResponse = zod.object({
   "analyzedAt": zod.string().describe('ISO timestamp'),
   "modelUsed": zod.string(),
   "indicators": zod.array(zod.string()).optional().describe('Text indicators that influenced the verdict'),
-  "keywords": zod.array(zod.string()).optional().describe('Exact words or phrases found in the text that triggered the verdict')
+  "keywords": zod.array(zod.object({
+  "word": zod.string().describe('The exact word or phrase matched in the text'),
+  "score": zod.number().describe('Severity score 0-100 for this specific keyword signal')
+})).optional().describe('Exact words or phrases found in the text that triggered the verdict, with per-keyword severity scores')
 })
 
 
