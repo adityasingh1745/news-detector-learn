@@ -165,6 +165,42 @@ CB_SCORED: list[tuple[str, str | None, int]] = [
 
     # Vague-pronoun clickbait ("This man did X")
     (r"\bthis (?:man|woman|guy|girl|dad|mom|teacher|doctor|nurse|kid|teen|student)\b", None, 60),
+
+    # Misinformation / pseudoscience / conspiracy — these belong in CLICKBAIT
+    # since we removed FAKE as a category
+    (r"\bearth is flat\b",                               "earth is flat",               95),
+    (r"\bflat earth\b",                                  "flat earth",                  95),
+    (r"\bearth isn'?t (?:round|a sphere|spherical)\b",   "earth isn't round",           95),
+    (r"\bmoon landing.{0,20}(?:fake|faked|hoax|staged)\b", "moon landing faked",        95),
+    (r"\bvaccines? (?:cause|caused|causes?) autism\b",   "vaccines cause autism",       95),
+    (r"\banti.?vax\b",                                   "anti-vax",                    82),
+    (r"\bclimate.{0,15}(?:hoax|fake|lie|scam|conspiracy)\b", "climate hoax",            92),
+    (r"\bstolen election\b",                             "stolen election",             92),
+    (r"\bdeep state\b",                                  "deep state",                  90),
+    (r"\b(?:a )?hoax\b",                                 "hoax",                        88),
+    (r"\bconspiracy\b",                                  "conspiracy",                  85),
+    (r"\bplandemic\b",                                   "plandemic",                   95),
+    (r"\bchemitrail(?:s)?\b",                            "chemtrails",                  92),
+    (r"\b(?:the )?illuminati\b",                         "illuminati",                  90),
+    (r"\bnew world order\b",                             "new world order",             90),
+    (r"\bsheeple\b",                                     "sheeple",                     90),
+    (r"\bwake up (?:people|sheeple|america)\b",          "wake up sheeple",             88),
+    (r"\bglobalist(?:s)?\b",                             "globalists",                  82),
+    (r"\bsuppressed\b",                                  "suppressed",                  80),
+    (r"\bpropaganda\b",                                  "propaganda",                  78),
+    (r"\bscam\b",                                        "scam",                        82),
+    (r"\bthey'?re (?:hiding|lying|covering)\b",          "they're hiding/lying",        88),
+    (r"\bcover.?up\b",                                   "cover-up",                    85),
+    (r"\bsecret agenda\b",                               "secret agenda",               88),
+    (r"\b(?:mind|thought) control\b",                    "mind control",                90),
+    (r"\b5G.{0,20}(?:dangerous|toxic|weapon|kill|cancer|control)\b", "5G dangerous",   92),
+    (r"\bsatanic\b",                                     "satanic",                     88),
+    (r"\bpedogate\b",                                    "pedogate",                    95),
+    (r"\bmainstream media.{0,20}(?:lie|lied|lying|hiding|covers)\b", "MSM lies",       88),
+    (r"\bthey don'?t want you to know\b",               "they don't want you to know", 90),
+    (r"\bbig pharma\b",                                  "big pharma",                  78),
+    (r"\bpseudoscience\b",                               "pseudoscience",               75),
+    (r"\bmisinformation\b",                              "misinformation",              70),
 ]
 
 # REAL / CREDIBILITY patterns — signal factual, journalistic reporting
@@ -331,31 +367,31 @@ def predict(headline: str, body: Optional[str]) -> PredictResponse:
     combined = headline + (" " + body[:600] if body else "")
     headline_lower = headline.lower()
 
-    # --- ML model credibility hint (0.0=not credible → 1.0=very credible) ---
+    # --- ML model: used only as a minor tiebreaker, NOT the primary classifier ---
+    # The HuggingFace model is unreliable for short/unusual inputs; cap its effect.
     model_label: Optional[str] = None
-    ml_credibility: float = 0.5  # neutral default
+    ml_nudge: float = 0.0  # adds at most ±0.08 to the real probability
 
     if classifier is not None:
         try:
             result = classifier(combined[:512])[0]
             model_label = normalise_label(result["label"])
-            raw_conf = float(result["score"])
+            raw_ml_conf = float(result["score"])
+            # Max nudge: ±0.08 regardless of model confidence
             if model_label == "REAL":
-                # Model confident it's real → push credibility toward 1.0
-                ml_credibility = 0.5 + raw_conf * 0.45
+                ml_nudge = raw_ml_conf * 0.08
             else:
-                # Model says fake → lower credibility but don't override clickbait detection
-                ml_credibility = 0.5 - raw_conf * 0.35
+                ml_nudge = -raw_ml_conf * 0.08
         except Exception as exc:
             logger.warning(f"Inference error: {exc}")
 
-    # --- Rule-based scoring ---
-    # Clickbait: headline weighted 100%, body weighted 25%
+    # --- Rule-based scoring (primary classifier) ---
+    # Clickbait: headline is primary, body is secondary
     cb_hl = score_patterns(headline, CB_SCORED)
     cb_body = score_patterns(body[:400] if body else "", CB_SCORED) * 0.25
     cb_raw = cb_hl + cb_body
 
-    # Structural boosts for clickbait
+    # Structural boosts
     if caps_ratio(headline) > CAPS_THRESHOLD:
         cb_raw += 65
     if re.search(r"!!+", headline):
@@ -365,34 +401,42 @@ def predict(headline: str, body: Optional[str]) -> PredictResponse:
     if re.search(r"\?$", headline):
         cb_raw += 25
 
-    # Real/credibility: headline + body (body contributes 60%)
+    # Real signals: headline + body
     real_hl = score_patterns(headline, REAL_SCORED)
     real_body = score_patterns(body[:600] if body else "", REAL_SCORED) * 0.6
     real_raw = real_hl + real_body
 
-    # Normalize: realistic max for heavy clickbait ~500, credible article ~450
+    # Normalize to [0, 1]
     p_cb_rule = min(cb_raw / 480.0, 1.0)
     p_real_rule = min(real_raw / 420.0, 1.0)
 
-    # Blend with ML credibility hint
-    # ML adjusts real probability ±15 percentage points max
-    ml_adj = (ml_credibility - 0.5) * 0.30
-    p_real_adj = max(0.0, min(1.0, p_real_rule + ml_adj - p_cb_rule * 0.35))
-    p_cb_adj = max(0.0, p_cb_rule * (1.0 - ml_credibility * 0.28))
+    has_signals = (p_cb_rule + p_real_rule) > 0.05
 
-    total = p_real_adj + p_cb_adj
-    if total < 0.01:
-        # No signals at all → lean real with moderate confidence
-        p_real_final = 0.72
-        p_cb_final = 0.28
-    else:
+    if has_signals:
+        # Rule-based dominates; ML nudges the real score slightly
+        p_real_adj = max(0.0, min(1.0, p_real_rule + ml_nudge - p_cb_rule * 0.35))
+        p_cb_adj = max(0.0, p_cb_rule)
+        total = p_real_adj + p_cb_adj
+        if total < 0.01:
+            total = 1.0
         p_real_final = p_real_adj / total
         p_cb_final = p_cb_adj / total
+    else:
+        # No rule signals at all (plain neutral sentence like "the sky is blue")
+        # Default: REAL at moderate confidence; ML nudge applies but stays modest
+        base_real = 0.62 + ml_nudge
+        p_real_final = max(0.45, min(0.78, base_real))
+        p_cb_final = 1.0 - p_real_final
 
     verdict = "CLICKBAIT" if p_cb_final > 0.5 else "REAL"
     raw_conf = p_cb_final if verdict == "CLICKBAIT" else p_real_final
-    # Clamp to realistic range — avoid 100% or 0%
-    confidence = round(max(42.0, min(97.0, raw_conf * 100)), 1)
+
+    # Scale confidence: strong signals → higher confidence; no signals → capped lower
+    if has_signals:
+        confidence = round(max(52.0, min(97.0, raw_conf * 100)), 1)
+    else:
+        # No clear signals — stay humble
+        confidence = round(max(52.0, min(72.0, raw_conf * 100)), 1)
 
     indicators = extract_indicators(headline, body, p_cb_final, p_real_final, model_label)
     keywords = extract_keywords(headline, body)
