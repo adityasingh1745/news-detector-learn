@@ -7,7 +7,7 @@
  */
 
 /**
- * Final verdict
+ * Final verdict. UNCERTAIN means there wasn't enough evidence to confidently call it REAL or CLICKBAIT.
  */
 export type AnalysisResultVerdict = typeof AnalysisResultVerdict[keyof typeof AnalysisResultVerdict];
 
@@ -15,4 +15,5 @@ export type AnalysisResultVerdict = typeof AnalysisResultVerdict[keyof typeof An
 export const AnalysisResultVerdict = {
   REAL: 'REAL',
   CLICKBAIT: 'CLICKBAIT',
+  UNCERTAIN: 'UNCERTAIN',
 } as const;

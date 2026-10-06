@@ -1,4 +1,4 @@
-# EVAL.OSINT — Fake News & Clickbait Detector
+# Clickbait Detection — Fake News & Clickbait Detector
 
 A web app that uses RoBERTa (HuggingFace) and rule-based heuristics to detect whether a news headline/article is **Real**, **Clickbait**, or **Fake**. Users can submit labeled corrections that accumulate as training samples.
 

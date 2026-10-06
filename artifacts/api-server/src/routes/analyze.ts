@@ -1,8 +1,11 @@
 import { Router } from "express";
 import { db, analysesTable, feedbackTable } from "@workspace/db";
-import { eq, desc, count, avg } from "drizzle-orm";
+import { eq, desc, count, avg, sql } from "drizzle-orm";
 import { AnalyzeNewsBody, SubmitFeedbackBody, GetHistoryQueryParams } from "@workspace/api-zod";
 import { logger } from "../lib/logger";
+import { classifyWithGemini } from "../lib/gemini";
+import { classifyWithGroq } from "../lib/groq";
+import { getMlStatus, isLocalModelReadyToReplaceGemini } from "../lib/mlStatus";
 
 const router = Router();
 
@@ -25,7 +28,21 @@ async function callMlService(headline: string, body?: string | null) {
     scores: { real: number; clickbait: number };
     indicators: string[];
     keywords: { word: string; score: number }[];
+    sources?: { label: string; title: string; url: string | null; publisher: string | null }[];
     model_used: string;
+    style_analysis?: {
+      verdict: string;
+      clickbait_score: number;
+      credible_score: number;
+      indicators: string[];
+      keywords: { word: string; score: number }[];
+      model_used: string;
+    } | null;
+    fact_check?: {
+      status: string;
+      note: string | null;
+      sources: { label: string; title: string; url: string | null; publisher: string | null }[];
+    } | null;
   }>;
 }
 
@@ -47,19 +64,94 @@ router.post("/analyze", async (req, res) => {
     return;
   }
 
+  // ── Community feedback majority-vote override ──────────────────────────
+  // If enough past users have flagged this exact headline the same way,
+  // trust that crowd signal over a single fresh model prediction. We
+  // require a genuine majority (>=2 votes, no tie) so a single differing
+  // opinion — or two users disagreeing with each other — never overrides
+  // the model on its own.
+  let finalVerdict = mlResult.verdict;
+  let finalScores = mlResult.scores;
+  let finalConfidence = mlResult.confidence;
+  let finalIndicators = mlResult.indicators;
+  let finalModelUsed = mlResult.model_used;
+
+  // ── Gemini (primary) → Groq (secondary) → local ML (last resort) ───────
+  // Gemini's verdict takes priority. If Gemini is unconfigured, rate-limited,
+  // or every candidate model is down, Groq is tried next as a second
+  // "teacher" model before falling back to the weaker local ML result.
+  // Once the local model has distilled enough Gemini+Groq-labeled examples
+  // to reproduce their judgment accurately on its own, we stop calling
+  // either API — this is how the system "graduates" off needing API keys.
+  try {
+    const graduated = await isLocalModelReadyToReplaceGemini();
+    if (graduated) {
+      req.log.info("Local model has graduated past Gemini/Groq; skipping both API calls");
+    } else {
+      const geminiResult = await classifyWithGemini(headline, body);
+      if (geminiResult) {
+        finalVerdict = geminiResult.verdict;
+        finalScores = geminiResult.scores;
+        finalConfidence = geminiResult.confidence;
+        finalIndicators = geminiResult.indicators;
+        finalModelUsed = geminiResult.modelUsed;
+      } else {
+        req.log.warn("Gemini unavailable; trying Groq as secondary classifier");
+        const groqResult = await classifyWithGroq(headline, body);
+        if (groqResult) {
+          finalVerdict = groqResult.verdict;
+          finalScores = groqResult.scores;
+          finalConfidence = groqResult.confidence;
+          finalIndicators = groqResult.indicators;
+          finalModelUsed = groqResult.modelUsed;
+        }
+      }
+    }
+  } catch (err) {
+    req.log.warn({ err }, "Gemini/Groq classification failed; using ML service result as-is");
+  }
+
+  try {
+    const voteRows = await db
+      .select({ correctLabel: feedbackTable.correctLabel, cnt: count() })
+      .from(feedbackTable)
+      .innerJoin(analysesTable, eq(feedbackTable.analysisId, analysesTable.id))
+      .where(sql`lower(trim(${analysesTable.headline})) = lower(trim(${headline}))`)
+      .groupBy(feedbackTable.correctLabel);
+
+    const sorted = voteRows
+      .map((r) => ({ label: r.correctLabel, votes: Number(r.cnt) }))
+      .sort((a, b) => b.votes - a.votes);
+
+    const top = sorted[0];
+    const runnerUp = sorted[1];
+    if (top && top.votes >= 2 && (!runnerUp || top.votes > runnerUp.votes)) {
+      finalVerdict = top.label;
+      finalConfidence = 80;
+      finalScores =
+        top.label === "CLICKBAIT" ? { real: 20, clickbait: 80 } : { real: 80, clickbait: 20 };
+      finalIndicators = [
+        `Verdict adjusted based on ${top.votes} user report(s) (community feedback)`,
+        ...mlResult.indicators,
+      ];
+    }
+  } catch (err) {
+    req.log.warn({ err }, "Feedback majority-vote lookup failed; using model result as-is");
+  }
+
   try {
     const [inserted] = await db
       .insert(analysesTable)
       .values({
         headline,
         body: body ?? null,
-        verdict: mlResult.verdict,
-        confidence: String(mlResult.confidence),
-        scoreReal: String(mlResult.scores.real),
-        scoreClickbait: String(mlResult.scores.clickbait),
+        verdict: finalVerdict,
+        confidence: String(finalConfidence),
+        scoreReal: String(finalScores.real),
+        scoreClickbait: String(finalScores.clickbait),
         scoreFake: "0",
-        indicators: mlResult.indicators,
-        modelUsed: mlResult.model_used,
+        indicators: finalIndicators,
+        modelUsed: finalModelUsed,
       })
       .returning();
 
@@ -75,8 +167,26 @@ router.post("/analyze", async (req, res) => {
       },
       indicators: inserted.indicators,
       keywords: mlResult.keywords ?? [],
+      sources: mlResult.sources ?? [],
       analyzedAt: inserted.analyzedAt.toISOString(),
       modelUsed: inserted.modelUsed,
+      styleAnalysis: mlResult.style_analysis
+        ? {
+            verdict: mlResult.style_analysis.verdict,
+            clickbaitScore: mlResult.style_analysis.clickbait_score,
+            credibleScore: mlResult.style_analysis.credible_score,
+            indicators: mlResult.style_analysis.indicators,
+            keywords: mlResult.style_analysis.keywords,
+            modelUsed: mlResult.style_analysis.model_used,
+          }
+        : undefined,
+      factCheck: mlResult.fact_check
+        ? {
+            status: mlResult.fact_check.status,
+            note: mlResult.fact_check.note,
+            sources: mlResult.fact_check.sources,
+          }
+        : undefined,
     });
   } catch (err) {
     req.log.error({ err }, "Database insert failed");
@@ -168,9 +278,9 @@ router.get("/stats", async (req, res) => {
       .from(analysesTable)
       .groupBy(analysesTable.verdict);
 
-    const verdictCounts = { REAL: 0, CLICKBAIT: 0 } as Record<string, number>;
+    const verdictCounts = { REAL: 0, CLICKBAIT: 0, UNCERTAIN: 0 } as Record<string, number>;
     for (const row of verdictRows) {
-      if (row.verdict === "REAL" || row.verdict === "CLICKBAIT") {
+      if (row.verdict === "REAL" || row.verdict === "CLICKBAIT" || row.verdict === "UNCERTAIN") {
         verdictCounts[row.verdict] = Number(row.cnt);
       }
     }
@@ -206,15 +316,8 @@ router.get("/stats", async (req, res) => {
 // GET /api/ml-status
 router.get("/ml-status", async (req, res) => {
   try {
-    const statusRes = await fetch(`${ML_SERVICE_URL}/status`, {
-      signal: AbortSignal.timeout(5000),
-    });
-    if (!statusRes.ok) throw new Error("ML status endpoint failed");
-    const mlStatus = (await statusRes.json()) as {
-      ready: boolean;
-      model_name: string;
-      last_retrained: string | null;
-    };
+    const mlStatus = await getMlStatus(true);
+    if (!mlStatus) throw new Error("ML status endpoint failed");
 
     const [feedbackTotal] = await db.select({ total: count() }).from(feedbackTable);
 
@@ -223,6 +326,13 @@ router.get("/ml-status", async (req, res) => {
       modelName: mlStatus.model_name,
       feedbackCount: Number(feedbackTotal.total),
       lastRetrained: mlStatus.last_retrained ?? null,
+      geminiExamplesUsed: mlStatus.gemini_examples_used ?? 0,
+      geminiAccuracy: mlStatus.gemini_accuracy ?? null,
+      groqExamplesUsed: mlStatus.groq_examples_used ?? 0,
+      groqAccuracy: mlStatus.groq_accuracy ?? null,
+      teacherExamplesUsed: mlStatus.teacher_examples_used ?? 0,
+      teacherAccuracy: mlStatus.teacher_accuracy ?? null,
+      readyForLocalOnly: mlStatus.ready_for_local_only ?? false,
     });
   } catch (err) {
     req.log.warn({ err }, "ML status check failed");
@@ -231,7 +341,61 @@ router.get("/ml-status", async (req, res) => {
       modelName: "unavailable",
       feedbackCount: 0,
       lastRetrained: null,
+      geminiExamplesUsed: 0,
+      geminiAccuracy: null,
+      groqExamplesUsed: 0,
+      groqAccuracy: null,
+      teacherExamplesUsed: 0,
+      teacherAccuracy: null,
+      readyForLocalOnly: false,
     });
+  }
+});
+
+// POST /api/retrain
+// Manually triggers an immediate retrain (normally runs automatically every
+// few hours). Useful to pull in newly accumulated Gemini-labeled examples
+// without waiting for the scheduled interval.
+router.post("/retrain", async (req, res) => {
+  try {
+    const retrainRes = await fetch(`${ML_SERVICE_URL}/retrain`, {
+      method: "POST",
+      signal: AbortSignal.timeout(60 * 60 * 1000), // retraining on the full dataset can take tens of minutes
+    });
+    if (!retrainRes.ok) {
+      const text = await retrainRes.text();
+      throw new Error(`ML retrain endpoint error ${retrainRes.status}: ${text}`);
+    }
+    const mlStatus = (await retrainRes.json()) as {
+      ready: boolean;
+      model_name: string;
+      feedback_count: number;
+      last_retrained: string | null;
+      gemini_examples_used: number;
+      gemini_accuracy: number | null;
+      groq_examples_used: number;
+      groq_accuracy: number | null;
+      teacher_examples_used: number;
+      teacher_accuracy: number | null;
+      ready_for_local_only: boolean;
+    };
+    await getMlStatus(true); // refresh the shared cache immediately
+    res.json({
+      ready: mlStatus.ready,
+      modelName: mlStatus.model_name,
+      feedbackCount: mlStatus.feedback_count,
+      lastRetrained: mlStatus.last_retrained ?? null,
+      geminiExamplesUsed: mlStatus.gemini_examples_used ?? 0,
+      geminiAccuracy: mlStatus.gemini_accuracy ?? null,
+      groqExamplesUsed: mlStatus.groq_examples_used ?? 0,
+      groqAccuracy: mlStatus.groq_accuracy ?? null,
+      teacherExamplesUsed: mlStatus.teacher_examples_used ?? 0,
+      teacherAccuracy: mlStatus.teacher_accuracy ?? null,
+      readyForLocalOnly: mlStatus.ready_for_local_only ?? false,
+    });
+  } catch (err) {
+    req.log.error({ err }, "Manual retrain trigger failed");
+    res.status(503).json({ error: "Failed to trigger retraining. Is the ML service running?" });
   }
 });
 

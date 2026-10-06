@@ -140,6 +140,23 @@ paths:
               schema:
                 $ref: "#/components/schemas/MlStatus"
 
+  /retrain:
+    post:
+      operationId: triggerRetrain
+      tags: [analysis]
+      summary: Manually trigger an immediate model retrain
+      description: >-
+        Normally runs automatically every few hours. Triggers it immediately
+        so newly accumulated Gemini-labeled examples and user feedback are
+        folded into the local model without waiting for the schedule.
+      responses:
+        "200":
+          description: Updated ML status after retraining
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MlStatus"
+
 components:
   schemas:
     HealthStatus:
@@ -190,8 +207,8 @@ components:
           type: ["string", "null"]
         verdict:
           type: string
-          enum: [REAL, CLICKBAIT]
-          description: Final verdict
+          enum: [REAL, CLICKBAIT, UNCERTAIN]
+          description: Final verdict. UNCERTAIN means there wasn't enough evidence to confidently call it REAL or CLICKBAIT.
         confidence:
           type: number
           description: Confidence score 0-100 for the verdict
@@ -212,6 +229,89 @@ components:
           items:
             $ref: "#/components/schemas/KeywordMatch"
           description: Clickbait signals found in the text with per-keyword severity scores
+        sources:
+          type: array
+          items:
+            $ref: "#/components/schemas/SourceRef"
+          description: Real articles or fact-checks found while verifying this claim, if any
+        styleAnalysis:
+          $ref: "#/components/schemas/StyleAnalysis"
+          description: >
+            Tier 1 — writing-style verdict from rules + the TF-IDF/structural
+            ML model only, independent of whether the claim is factually true.
+        factCheck:
+          $ref: "#/components/schemas/FactCheckAnalysis"
+          description: >
+            Tier 2 — real-world corroboration from news search, professional
+            fact-checkers, and Wikipedia; never looks at headline phrasing.
+
+    StyleAnalysis:
+      type: object
+      required:
+        - verdict
+        - clickbaitScore
+        - credibleScore
+        - indicators
+        - keywords
+        - modelUsed
+      properties:
+        verdict:
+          type: string
+          enum: [CLICKBAIT_STYLE, NEUTRAL_STYLE, CREDIBLE_STYLE]
+        clickbaitScore:
+          type: number
+          description: 0-100 writing-style clickbait score
+        credibleScore:
+          type: number
+          description: 0-100 writing-style credibility score
+        indicators:
+          type: array
+          items:
+            type: string
+        keywords:
+          type: array
+          items:
+            $ref: "#/components/schemas/KeywordMatch"
+        modelUsed:
+          type: string
+
+    FactCheckAnalysis:
+      type: object
+      required:
+        - status
+      properties:
+        status:
+          type: string
+          description: >
+            corroborated | partially_corroborated | no_coverage |
+            unconfirmed_claim | inconclusive | fact_checked_true |
+            fact_checked_false | fact_checked_mixed | wiki_confirmed |
+            wiki_contradicted | wiki_related | not_checked
+        note:
+          type: ["string", "null"]
+        sources:
+          type: array
+          items:
+            $ref: "#/components/schemas/SourceRef"
+
+    SourceRef:
+      type: object
+      required:
+        - label
+        - title
+      properties:
+        label:
+          type: string
+          description: What this source represents, e.g. "Fact-check" or "News coverage"
+        title:
+          type: string
+          description: The article/fact-check title
+        url:
+          type: ["string", "null"]
+          description: Link to the original source
+        publisher:
+          type: ["string", "null"]
+          description: The outlet/publisher name
 
     ScoreBreakdown:
       type: object
@@ -270,7 +370,7 @@ components:
           type: string
         verdict:
           type: string
-          enum: [REAL, CLICKBAIT]
+          enum: [REAL, CLICKBAIT, UNCERTAIN]
         confidence:
           type: number
         analyzedAt:
@@ -304,10 +404,13 @@ components:
       required:
         - REAL
         - CLICKBAIT
+        - UNCERTAIN
       properties:
         REAL:
           type: integer
         CLICKBAIT:
+          type: integer
+        UNCERTAIN:
           type: integer
 
     KeywordMatch:
@@ -339,3 +442,24 @@ components:
           type: integer
         lastRetrained:
           type: ["string", "null"]
+        geminiExamplesUsed:
+          type: integer
+          description: Number of Gemini-labeled analyses folded into the local model's training data so far.
+        geminiAccuracy:
+          type: ["number", "null"]
+          description: Local model's accuracy at reproducing Gemini's labels on a held-out test split.
+        groqExamplesUsed:
+          type: integer
+          description: Number of Groq-labeled analyses folded into the local model's training data so far.
+        groqAccuracy:
+          type: ["number", "null"]
+          description: Local model's accuracy at reproducing Groq's labels on a held-out test split.
+        teacherExamplesUsed:
+          type: integer
+          description: Combined number of Gemini + Groq labeled examples folded into the local model's training data.
+        teacherAccuracy:
+          type: ["number", "null"]
+          description: Local model's combined accuracy at reproducing Gemini + Groq labels on a held-out test split; this is what graduation is based on.
+        readyForLocalOnly:
+          type: boolean
+          description: True once the local model has distilled enough Gemini/Groq-labeled examples accurately enough that neither API is needed for new classifications.

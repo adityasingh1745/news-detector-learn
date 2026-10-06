@@ -6,15 +6,18 @@
  * OpenAPI spec version: 0.1.0
  */
 import type { AnalysisResultVerdict } from './analysisResultVerdict';
+import type { FactCheckAnalysis } from './factCheckAnalysis';
 import type { KeywordMatch } from './keywordMatch';
 import type { ScoreBreakdown } from './scoreBreakdown';
+import type { SourceRef } from './sourceRef';
+import type { StyleAnalysis } from './styleAnalysis';
 
 export interface AnalysisResult {
   id: number;
   headline: string;
   /** @nullable */
   body?: string | null;
-  /** Final verdict */
+  /** Final verdict. UNCERTAIN means there wasn't enough evidence to confidently call it REAL or CLICKBAIT. */
   verdict: AnalysisResultVerdict;
   /** Confidence score 0-100 for the verdict */
   confidence: number;
@@ -26,4 +29,12 @@ export interface AnalysisResult {
   indicators?: string[];
   /** Clickbait signals found in the text with per-keyword severity scores */
   keywords?: KeywordMatch[];
+  /** Real articles or fact-checks found while verifying this claim, if any */
+  sources?: SourceRef[];
+  /** Tier 1 — writing-style verdict from rules + the TF-IDF/structural ML model only, independent of whether the claim is factually true.
+   */
+  styleAnalysis?: StyleAnalysis;
+  /** Tier 2 — real-world corroboration from news search, professional fact-checkers, and Wikipedia; never looks at headline phrasing.
+   */
+  factCheck?: FactCheckAnalysis;
 }

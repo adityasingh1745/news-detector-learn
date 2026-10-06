@@ -46,4 +46,25 @@ Thumbs.db
 
 # Replit
 .cache/
+
+# Local dev run scripts (contain DB credentials) - see .local/run-project.ps1
 .local/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Raw datasets (too large for git; not needed to run the app)
+/archive/
+/archive (1)/
+/archive (2)/
+/Clickbait-Detection-main/
+
+# Trained ML model artifacts (regenerated on the ML host / HF Space)
+services/ml-api/models/
+services/ml-api/__pycache__/
+**/__pycache__/
+
+# Generated documents (not part of the app)
+*.pdf

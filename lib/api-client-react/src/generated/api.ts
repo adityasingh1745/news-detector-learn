@@ -507,3 +507,74 @@ export function useGetMlStatus<TData = Awaited<ReturnType<typeof getMlStatus>>, 
 
 
 
+export const getTriggerRetrainUrl = () => {
+
+
+
+
+  return `/api/retrain`
+}
+
+/**
+ * Normally runs automatically every few hours. Triggers it immediately so newly accumulated Gemini-labeled examples and user feedback are folded into the local model without waiting for the schedule.
+ * @summary Manually trigger an immediate model retrain
+ */
+export const triggerRetrain = async ( options?: RequestInit): Promise<MlStatus> => {
+
+  return customFetch<MlStatus>(getTriggerRetrainUrl(),
+  {
+    ...options,
+    method: 'POST'
+
+
+  }
+);}
+
+
+
+
+export const getTriggerRetrainMutationOptions = <TError = ErrorType<unknown>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof triggerRetrain>>, TError,void, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof triggerRetrain>>, TError,void, TContext> => {
+
+const mutationKey = ['triggerRetrain'];
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof triggerRetrain>>, void> = () => {
+
+
+          return  triggerRetrain(requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type TriggerRetrainMutationResult = NonNullable<Awaited<ReturnType<typeof triggerRetrain>>>
+
+    export type TriggerRetrainMutationError = ErrorType<unknown>
+
+    /**
+ * @summary Manually trigger an immediate model retrain
+ */
+export const useTriggerRetrain = <TError = ErrorType<unknown>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof triggerRetrain>>, TError,void, TContext>, request?: SecondParameter<typeof customFetch>}
+ ): UseMutationResult<
+        Awaited<ReturnType<typeof triggerRetrain>>,
+        TError,
+        void,
+        TContext
+      > => {
+      return useMutation(getTriggerRetrainMutationOptions(options));
+    }
+

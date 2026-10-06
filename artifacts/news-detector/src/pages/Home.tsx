@@ -19,15 +19,18 @@ import {
   Activity,
   AlertTriangle,
   CheckCircle2,
+  HelpCircle,
   Database,
   Zap,
   Search,
   ChevronRight,
+  ChevronDown,
+  ExternalLink,
   RotateCcw,
 } from "lucide-react";
 import { format } from "date-fns";
 
-type VerdictType = "REAL" | "CLICKBAIT";
+type VerdictType = "REAL" | "CLICKBAIT" | "UNCERTAIN";
 
 const verdictConfig = {
   REAL: {
@@ -48,6 +51,15 @@ const verdictConfig = {
     chip: "bg-amber-500/10 border-amber-500/40 text-amber-400",
     badge: "bg-amber-500/25 text-amber-300",
   },
+  UNCERTAIN: {
+    icon: HelpCircle,
+    color: "text-sky-400",
+    bg: "bg-sky-400",
+    border: "border-sky-400",
+    glow: "bg-sky-400/10 border-sky-400/30",
+    chip: "bg-sky-400/10 border-sky-400/40 text-sky-300",
+    badge: "bg-sky-400/20 text-sky-300",
+  },
 } as const;
 
 export default function Home() {
@@ -56,6 +68,7 @@ export default function Home() {
   const [body, setBody] = useState("");
   const [currentResultId, setCurrentResultId] = useState<number | null>(null);
   const [feedbackSubmitted, setFeedbackSubmitted] = useState(false);
+  const [sourcesExpanded, setSourcesExpanded] = useState(false);
 
   const { data: mlStatus } = useGetMlStatus({
     query: {
@@ -90,13 +103,14 @@ export default function Home() {
     e.preventDefault();
     if (!headline.trim()) return;
     setFeedbackSubmitted(false);
+    setSourcesExpanded(false);
     analyzeNews.mutate(
       { data: { headline, body: body.trim() || undefined } },
       { onSuccess: (data) => setCurrentResultId(data.id) }
     );
   };
 
-  const handleFeedback = (verdict: VerdictType) => {
+  const handleFeedback = (verdict: "REAL" | "CLICKBAIT") => {
     if (!currentResultId) return;
     submitFeedback.mutate({ data: { analysisId: currentResultId, correctLabel: verdict } });
   };
@@ -106,6 +120,7 @@ export default function Home() {
     setBody("");
     setCurrentResultId(null);
     setFeedbackSubmitted(false);
+    setSourcesExpanded(false);
     analyzeNews.reset();
   };
 
@@ -127,7 +142,7 @@ export default function Home() {
             <div className="w-8 h-8 rounded-sm bg-primary flex items-center justify-center text-primary-foreground font-mono font-bold text-lg">
               {"//"}
             </div>
-            <h1 className="font-mono font-bold tracking-tight text-lg">EVAL.OSINT</h1>
+            <h1 className="font-mono font-bold tracking-tight text-lg">Clickbait Detection</h1>
           </div>
           <div className="flex items-center gap-4 text-xs font-mono">
             <div className="flex items-center gap-2 text-muted-foreground">
@@ -162,7 +177,7 @@ export default function Home() {
             <CardHeader>
               <CardTitle className="font-mono text-xl flex items-center gap-2">
                 <Search className="w-5 h-5 text-muted-foreground" />
-                NEW_ANALYSIS
+                NEWS_ANALYSIS
               </CardTitle>
             </CardHeader>
             <CardContent>
@@ -357,6 +372,57 @@ export default function Home() {
                       </ul>
                     </div>
                   )}
+
+                  {/* Source evidence */}
+                  {result.sources && result.sources.length > 0 && (
+                    <div className="space-y-3">
+                      <button
+                        type="button"
+                        onClick={() => setSourcesExpanded((v) => !v)}
+                        className="flex items-center justify-between w-full font-mono text-xs font-semibold tracking-wider text-muted-foreground hover:text-foreground transition-colors"
+                        data-testid="button-toggle-sources"
+                      >
+                        <span>SOURCE_EVIDENCE ({result.sources.length})</span>
+                        {sourcesExpanded ? (
+                          <ChevronDown className="w-4 h-4" />
+                        ) : (
+                          <ChevronRight className="w-4 h-4" />
+                        )}
+                      </button>
+                      {sourcesExpanded && (
+                        <ul className="grid gap-2">
+                          {result.sources.map((source, i) => (
+                            <li
+                              key={i}
+                              className="text-sm font-mono bg-background p-3 rounded border border-border/30 space-y-1"
+                            >
+                              <span className="block text-[10px] uppercase tracking-wider text-primary">
+                                {source.label}
+                              </span>
+                              {source.url ? (
+                                <a
+                                  href={source.url}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  className="flex items-start gap-1.5 text-foreground hover:text-primary hover:underline"
+                                >
+                                  <span>{source.title}</span>
+                                  <ExternalLink className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+                                </a>
+                              ) : (
+                                <span className="text-foreground">{source.title}</span>
+                              )}
+                              {source.publisher && (
+                                <span className="block text-xs text-muted-foreground">
+                                  — {source.publisher}
+                                </span>
+                              )}
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                    </div>
+                  )}
                 </CardContent>
               </Card>
 
@@ -365,9 +431,13 @@ export default function Home() {
                 <Card className="border-primary/20 bg-primary/5">
                   <CardContent className="p-6 flex flex-col sm:flex-row items-center justify-between gap-6">
                     <div className="space-y-1 text-center sm:text-left">
-                      <h3 className="font-mono font-semibold">Verify Result</h3>
+                      <h3 className="font-mono font-semibold">
+                        {verdict === "UNCERTAIN" ? "Do you know the real answer?" : "Was this correct?"}
+                      </h3>
                       <p className="text-sm text-muted-foreground font-mono">
-                        Help calibrate {result.modelUsed}. Your feedback trains the model.
+                        {verdict === "UNCERTAIN"
+                          ? "We couldn't verify this confidently. If you know the answer, tell us."
+                          : "Tell us the actual answer to help improve future results."}
                       </p>
                     </div>
                     <div className="flex flex-wrap gap-2 justify-center">
@@ -379,7 +449,7 @@ export default function Home() {
                         className="font-mono text-emerald-500 border-emerald-500/30 hover:bg-emerald-500/10"
                         data-testid="button-feedback-real"
                       >
-                        TRUE: REAL
+                        Real
                       </Button>
                       <Button
                         variant="outline"
@@ -389,7 +459,7 @@ export default function Home() {
                         className="font-mono text-amber-500 border-amber-500/30 hover:bg-amber-500/10"
                         data-testid="button-feedback-clickbait"
                       >
-                        TRUE: CLICKBAIT
+                        Clickbait
                       </Button>
                     </div>
                   </CardContent>
@@ -432,12 +502,17 @@ export default function Home() {
                           style={{ width: `${(stats.verdictCounts.REAL / totalScanned) * 100}%` }}
                         />
                         <div
+                          className="bg-sky-400 h-full transition-all duration-500"
+                          style={{ width: `${(stats.verdictCounts.UNCERTAIN / totalScanned) * 100}%` }}
+                        />
+                        <div
                           className="bg-amber-500 h-full transition-all duration-500"
                           style={{ width: `${(stats.verdictCounts.CLICKBAIT / totalScanned) * 100}%` }}
                         />
                       </div>
                       <div className="flex justify-between text-[10px] font-mono mt-1">
                         <span className="text-emerald-500">{stats.verdictCounts.REAL} REAL</span>
+                        <span className="text-sky-400">{stats.verdictCounts.UNCERTAIN} UNCERTAIN</span>
                         <span className="text-amber-500">{stats.verdictCounts.CLICKBAIT} CLICKBAIT</span>
                       </div>
                     </div>

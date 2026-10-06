@@ -27,7 +27,7 @@ export interface NewsInput {
 }
 
 /**
- * Final verdict
+ * Final verdict. UNCERTAIN means there wasn't enough evidence to confidently call it REAL or CLICKBAIT.
  */
 export type AnalysisResultVerdict = typeof AnalysisResultVerdict[keyof typeof AnalysisResultVerdict];
 
@@ -35,6 +35,7 @@ export type AnalysisResultVerdict = typeof AnalysisResultVerdict[keyof typeof An
 export const AnalysisResultVerdict = {
   REAL: 'REAL',
   CLICKBAIT: 'CLICKBAIT',
+  UNCERTAIN: 'UNCERTAIN',
 } as const;
 
 export interface ScoreBreakdown {
@@ -51,12 +52,58 @@ export interface KeywordMatch {
   score: number;
 }
 
+export interface SourceRef {
+  /** What this source represents, e.g. "Fact-check" or "News coverage" */
+  label: string;
+  /** The article/fact-check title */
+  title: string;
+  /**
+     * Link to the original source
+     * @nullable
+     */
+  url?: string | null;
+  /**
+     * The outlet/publisher name
+     * @nullable
+     */
+  publisher?: string | null;
+}
+
+export type StyleAnalysisVerdict = typeof StyleAnalysisVerdict[keyof typeof StyleAnalysisVerdict];
+
+
+export const StyleAnalysisVerdict = {
+  CLICKBAIT_STYLE: 'CLICKBAIT_STYLE',
+  NEUTRAL_STYLE: 'NEUTRAL_STYLE',
+  CREDIBLE_STYLE: 'CREDIBLE_STYLE',
+} as const;
+
+export interface StyleAnalysis {
+  verdict: StyleAnalysisVerdict;
+  /** 0-100 writing-style clickbait score */
+  clickbaitScore: number;
+  /** 0-100 writing-style credibility score */
+  credibleScore: number;
+  indicators: string[];
+  keywords: KeywordMatch[];
+  modelUsed: string;
+}
+
+export interface FactCheckAnalysis {
+  /** corroborated | partially_corroborated | no_coverage | unconfirmed_claim | inconclusive | fact_checked_true | fact_checked_false | fact_checked_mixed | wiki_confirmed | wiki_contradicted | wiki_related | not_checked
+   */
+  status: string;
+  /** @nullable */
+  note?: string | null;
+  sources?: SourceRef[];
+}
+
 export interface AnalysisResult {
   id: number;
   headline: string;
   /** @nullable */
   body?: string | null;
-  /** Final verdict */
+  /** Final verdict. UNCERTAIN means there wasn't enough evidence to confidently call it REAL or CLICKBAIT. */
   verdict: AnalysisResultVerdict;
   /** Confidence score 0-100 for the verdict */
   confidence: number;
@@ -68,6 +115,14 @@ export interface AnalysisResult {
   indicators?: string[];
   /** Clickbait signals found in the text with per-keyword severity scores */
   keywords?: KeywordMatch[];
+  /** Real articles or fact-checks found while verifying this claim, if any */
+  sources?: SourceRef[];
+  /** Tier 1 — writing-style verdict from rules + the TF-IDF/structural ML model only, independent of whether the claim is factually true.
+   */
+  styleAnalysis?: StyleAnalysis;
+  /** Tier 2 — real-world corroboration from news search, professional fact-checkers, and Wikipedia; never looks at headline phrasing.
+   */
+  factCheck?: FactCheckAnalysis;
 }
 
 /**
@@ -101,6 +156,7 @@ export type HistoryItemVerdict = typeof HistoryItemVerdict[keyof typeof HistoryI
 export const HistoryItemVerdict = {
   REAL: 'REAL',
   CLICKBAIT: 'CLICKBAIT',
+  UNCERTAIN: 'UNCERTAIN',
 } as const;
 
 export interface HistoryItem {
@@ -115,6 +171,7 @@ export interface HistoryItem {
 export interface VerdictCounts {
   REAL: number;
   CLICKBAIT: number;
+  UNCERTAIN: number;
 }
 
 export interface Stats {
@@ -135,6 +192,29 @@ export interface MlStatus {
   feedbackCount: number;
   /** @nullable */
   lastRetrained: string | null;
+  /** Number of Gemini-labeled analyses folded into the local model's training data so far. */
+  geminiExamplesUsed?: number;
+  /**
+     * Local model's accuracy at reproducing Gemini's labels on a held-out test split.
+     * @nullable
+     */
+  geminiAccuracy?: number | null;
+  /** Number of Groq-labeled analyses folded into the local model's training data so far. */
+  groqExamplesUsed?: number;
+  /**
+     * Local model's accuracy at reproducing Groq's labels on a held-out test split.
+     * @nullable
+     */
+  groqAccuracy?: number | null;
+  /** Combined number of Gemini + Groq labeled examples folded into the local model's training data. */
+  teacherExamplesUsed?: number;
+  /**
+     * Local model's combined accuracy at reproducing Gemini + Groq labels on a held-out test split; this is what graduation is based on.
+     * @nullable
+     */
+  teacherAccuracy?: number | null;
+  /** True once the local model has distilled enough Gemini/Groq-labeled examples accurately enough that neither API is needed for new classifications. */
+  readyForLocalOnly?: boolean;
 }
 
 export type GetHistoryParams = {

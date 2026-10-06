@@ -1,13 +1,20 @@
 """
-News Credibility & Clickbait Detection — Rule-Based Classifier v3
+News Credibility & Clickbait Detection — Hybrid ML + Rule-Based Classifier
 Classifies news as REAL (credible journalism) or CLICKBAIT (sensational/bait/misinfo).
-Pure pattern-based — no external model required. Starts instantly.
+Uses a TF-IDF + Logistic Regression model trained on a 32k-headline labeled
+dataset (see train_model.py), blended with pattern-based heuristics.
+Falls back to pure rule-based scoring if the trained model file is missing.
 """
+import asyncio
 import os
 import re
 import logging
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Optional
+from urllib.parse import urlparse
+import joblib
+import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -15,8 +22,591 @@ from pydantic import BaseModel
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+HERE = os.path.dirname(os.path.abspath(__file__))
+MODEL_PATH = os.path.join(HERE, "models", "clickbait_model.joblib")
+DATABASE_URL = os.environ.get("DATABASE_URL")
+# How often to check for new user feedback and retrain the model on it.
+# Raised from 10 minutes to 6 hours now that the base dataset includes the
+# full ~3.9M-row archive corpus — a full retrain takes ~30-40 minutes, so a
+# short interval would cause retrains to pile up / constantly thrash CPU.
+RETRAIN_INTERVAL_SECONDS = int(os.environ.get("RETRAIN_INTERVAL_SECONDS", "21600"))
+
 model_name = "rule-based-v3"
 model_ready = False
+
+# Populated at startup if a trained model is found on disk.
+ml_vectorizer = None
+ml_classifier = None
+model_feedback_examples_used = 0
+model_last_retrained: Optional[str] = None
+# Distillation progress: how many teacher-labeled (Gemini + Groq) analyses
+# the model has been trained on, and how accurately it reproduces their
+# combined labels on a held-out split of those examples. Once both
+# thresholds below are met, the local model is considered a reliable
+# enough standalone replacement for both APIs.
+model_gemini_examples_used = 0
+model_gemini_accuracy: Optional[float] = None
+model_groq_examples_used = 0
+model_groq_accuracy: Optional[float] = None
+model_teacher_examples_used = 0
+model_teacher_accuracy: Optional[float] = None
+GEMINI_GRADUATION_MIN_EXAMPLES = int(os.environ.get("GEMINI_GRADUATION_MIN_EXAMPLES", "300"))
+GEMINI_GRADUATION_MIN_ACCURACY = float(os.environ.get("GEMINI_GRADUATION_MIN_ACCURACY", "0.92"))
+
+
+def _is_ready_for_local_only() -> bool:
+    """True once the local model has distilled enough teacher-labeled
+    (Gemini + Groq combined) examples and reproduces their judgment
+    accurately enough that neither API is needed for new classifications."""
+    return (
+        model_teacher_examples_used >= GEMINI_GRADUATION_MIN_EXAMPLES
+        and model_teacher_accuracy is not None
+        and model_teacher_accuracy >= GEMINI_GRADUATION_MIN_ACCURACY
+    )
+
+# Weight given to the ML model vs. the rule-based heuristics when blending
+# scores (matches the architecture described in replit.md).
+ML_WEIGHT = 0.6
+RULE_WEIGHT = 1.0 - ML_WEIGHT
+
+# ── Real-world fact-checking via NewsAPI.org ────────────────────────────────
+# Verifies whether a claim has any actual corroborating news coverage. This
+# catches confidently-worded but fabricated claims (e.g. "2036 Olympics will
+# be hosted in Bangladesh") that pure style/pattern analysis cannot detect.
+NEWS_API_KEY = os.environ.get("NEWS_API_KEY")
+NEWS_API_URL = "https://newsapi.org/v2/everything"
+
+# Low-quality / self-published domains that should never be surfaced as
+# "evidence" even if they happen to match search terms — personal blogs,
+# free blogging platforms, and known misinformation mirrors are not
+# credible corroboration for a factual claim.
+_LOW_QUALITY_DOMAINS = {
+    "wordpress.com", "blogspot.com", "substack.com", "medium.com",
+    "tumblr.com", "weebly.com", "wixsite.com", "sites.google.com",
+    "blogger.com", "livejournal.com",
+}
+
+
+def _is_low_quality_source(url: Optional[str]) -> bool:
+    if not url:
+        return False
+    host = urlparse(url).netloc.lower()
+    host = host[4:] if host.startswith("www.") else host
+    return any(host == d or host.endswith("." + d) for d in _LOW_QUALITY_DOMAINS)
+
+_STOPWORDS = {
+    "a", "an", "the", "is", "are", "was", "were", "be", "been", "will", "would",
+    "could", "should", "of", "in", "on", "at", "to", "for", "and", "or", "but",
+    "with", "by", "from", "as", "this", "that", "these", "those", "it", "its",
+    "his", "her", "their", "your", "our", "my", "has", "have", "had", "not",
+    "going", "gonna", "new", "just", "now", "get", "gets", "getting",
+}
+
+
+def _extract_query_terms(headline: str, max_terms: int = 6) -> list[str]:
+    """Pick out the most distinctive words (proper nouns, numbers) to search for."""
+    words = re.findall(r"[A-Za-z0-9']+", headline)
+    important = [w for w in words if w.isdigit() or (w[:1].isupper() and w.lower() not in _STOPWORDS)]
+    if len(important) >= 2:
+        return important[:max_terms]
+    return [w for w in words if w.lower() not in _STOPWORDS][:max_terms]
+
+
+def _extract_entities_and_content(headline: str) -> tuple[list[str], list[str]]:
+    """Split headline words into (entities, content_words) — see _extract_search_terms."""
+    words = re.findall(r"[A-Za-z0-9']+", headline)
+    entities = [w for w in words if w.isdigit() or (w[:1].isupper() and w.lower() not in _STOPWORDS)]
+    content_words = [
+        w for w in words
+        if w.lower() not in _STOPWORDS and w not in entities and len(w) > 2
+    ]
+    return entities, content_words
+
+
+def _extract_search_terms(headline: str, max_terms: int = 6) -> list[str]:
+    """
+    Build the set of words used both to search NewsAPI *and* to verify
+    corroboration. Deliberately includes proper nouns/numbers ("USA", "2028",
+    "Rahul", "Gandhi") *and* the key non-filler content words ("olympics",
+    "host", "dead", "resigns") — not just capitalized entities. Requiring the
+    actual topic/claim word to be part of the match is what lets us tell
+    "real event about a real entity" apart from "hoax claim riding on a real
+    entity's name" (e.g. a politician's name trending without any article
+    ever mentioning the claimed event).
+    """
+    entities, content_words = _extract_entities_and_content(headline)
+    # Entities first (who/what), then the most distinctive remaining content
+    # words (longer words tend to be more specific/meaningful), deduped.
+    content_words = sorted(content_words, key=len, reverse=True)
+    seen = {w.lower() for w in entities}
+    combined = list(entities)
+    for w in content_words:
+        if w.lower() not in seen:
+            combined.append(w)
+            seen.add(w.lower())
+        if len(combined) >= max_terms:
+            break
+    return combined
+
+
+# Subjective opinion/value-judgment words. Headlines built around these
+# ("X is bad for the world", "Y is the greatest country") are not factual
+# claims that news coverage can corroborate or refute — bag-of-words article
+# overlap on the surrounding entity/topic words can accidentally "match" a
+# totally unrelated article and produce a misleading fact-check verdict.
+# When detected, skip NewsAPI corroboration entirely and let the ML/rules
+# model judge the phrasing/style on its own merits.
+_OPINION_WORDS = {
+    "bad", "terrible", "awful", "evil", "disgusting", "horrible",
+    "ugly", "stupid", "corrupt", "toxic", "dangerous", "harmful",
+}
+
+# Subjective *skill/talent* praise about an individual person ("the finest
+# cover drive player", "the greatest footballer ever") is unfact-checkable —
+# no news database can confirm who is "the best" at something subjective.
+# This is distinct from claims about institutions/measurable rankings
+# (e.g. "best healthcare system"), which real surveys/reports DO cover and
+# should still go through NewsAPI corroboration.
+_SKILL_OPINION_PATTERN = re.compile(
+    r"\b(finest|greatest|best|worst|most talented|most skilled|legendary|goat)\b"
+    r".{0,35}\b(player|cricketer|batsman|batter|bowler|footballer|striker|"
+    r"goalkeeper|driver|racer|singer|actor|actress|artist|chef|dancer|"
+    r"athlete|golfer|boxer|wrestler|sportsman|sportswoman)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_opinion_headline(headline: str) -> bool:
+    words = {w.lower() for w in re.findall(r"[A-Za-z']+", headline)}
+    if words & _OPINION_WORDS:
+        return True
+    return bool(_SKILL_OPINION_PATTERN.search(headline))
+
+
+async def fact_check_headline(headline: str) -> Optional[dict]:
+    """
+    Search NewsAPI.org for real coverage of this claim.
+    Returns None when fact-checking is unavailable/inconclusive (no adjustment
+    should be made), or a dict describing the corroboration status.
+    """
+    if not NEWS_API_KEY:
+        return None
+
+    if _is_opinion_headline(headline):
+        return None  # subjective claim — news corroboration doesn't apply
+
+    terms = _extract_search_terms(headline)
+    if len(terms) < 2:
+        return None  # not enough distinctive terms to search meaningfully
+
+    query = " ".join(terms)
+    try:
+        async with httpx.AsyncClient(timeout=6.0) as client:
+            resp = await client.get(
+                NEWS_API_URL,
+                params={
+                    "q": query,
+                    "language": "en",
+                    "sortBy": "relevancy",
+                    "pageSize": 8,
+                    "apiKey": NEWS_API_KEY,
+                },
+            )
+        if resp.status_code != 200:
+            logger.warning("NewsAPI error %s: %s", resp.status_code, resp.text[:200])
+            return None
+        data = resp.json()
+    except Exception:
+        logger.exception("NewsAPI request failed")
+        return None
+
+    articles = data.get("articles", []) or []
+    total_results = data.get("totalResults", 0)
+    term_set = {t.lower() for t in terms}
+    # Numbers (years, counts) are highly distinctive — if the headline names
+    # one, a candidate article must actually mention it to be considered a
+    # genuine match, not just an incidental overlap on generic words.
+    required_numbers = {t.lower() for t in terms if t.isdigit()}
+
+    best_overlap = 0.0
+    best_has_required_numbers = True
+    top_source = None
+    top_article = None
+    # Track the best candidate that actually mentions required numbers
+    # separately — it should win over a higher-raw-overlap article that
+    # omits a distinctive year/count, since the number is what makes the
+    # claim specific in the first place.
+    best_overlap_with_numbers = -1.0
+    top_source_with_numbers = None
+    top_article_with_numbers = None
+    for a in articles:
+        if _is_low_quality_source(a.get("url")):
+            continue  # never surface personal blogs/self-published posts as evidence
+        title = (a.get("title") or "").lower()
+        desc = (a.get("description") or "").lower()
+        text = f"{title} {desc}"
+        hits = sum(1 for t in term_set if t in text)
+        overlap = hits / len(term_set) if term_set else 0.0
+        has_required_numbers = all(n in text for n in required_numbers)
+        if overlap > best_overlap:
+            best_overlap = overlap
+            best_has_required_numbers = has_required_numbers
+            top_source = (a.get("source") or {}).get("name")
+            top_article = {
+                "title": a.get("title"),
+                "url": a.get("url"),
+                "publisher": top_source,
+            }
+        if has_required_numbers and overlap > best_overlap_with_numbers:
+            best_overlap_with_numbers = overlap
+            top_source_with_numbers = (a.get("source") or {}).get("name")
+            top_article_with_numbers = {
+                "title": a.get("title"),
+                "url": a.get("url"),
+                "publisher": top_source_with_numbers,
+            }
+
+    if required_numbers and top_article_with_numbers is not None:
+        # A more specific (number-matching) candidate exists — prefer it for
+        # display even if a generic-word match scored marginally higher.
+        top_source = top_source_with_numbers
+        top_article = top_article_with_numbers
+        best_has_required_numbers = True
+
+    # Always surface whatever article we found (already filtered for
+    # low-quality domains and, when relevant, preferring one that actually
+    # mentions a distinctive number/year) — users asked to be able to check
+    # the evidence themselves rather than have us silently hide weak
+    # matches. We still flag weak matches so the label can be honest about
+    # how confident this specific match is.
+    displayable_article = top_article
+    weak_match = best_overlap < 0.3 or (required_numbers and not best_has_required_numbers)
+
+    if total_results == 0:
+        return {"status": "no_coverage", "articles_found": 0, "top_source": None, "top_article": None}
+
+    if best_overlap >= 0.6 and best_has_required_numbers:
+        return {
+            "status": "corroborated", "articles_found": total_results,
+            "top_source": top_source, "top_article": displayable_article, "weak_match": weak_match,
+        }
+
+    if best_overlap >= 0.35 and total_results < 50:
+        # A genuinely close (if imperfect) match exists — e.g. a headline
+        # phrased slightly differently than the matching article's title.
+        # This is a positive but not fully conclusive signal, so it gets a
+        # mild nudge toward REAL rather than the full "corroborated" boost.
+        return {
+            "status": "partially_corroborated", "articles_found": total_results,
+            "top_source": top_source, "top_article": displayable_article, "weak_match": weak_match,
+        }
+
+    if total_results >= 50:
+        # The overall topic/entity is heavily covered, but no returned
+        # article actually matches this specific combination of terms — a
+        # classic sign of a fabricated/hoax claim riding on a real, famous
+        # entity's name (e.g. a politician's "death" claim with no obituary
+        # anywhere despite thousands of unrelated articles about them).
+        return {
+            "status": "unconfirmed_claim", "articles_found": total_results,
+            "top_source": top_source, "top_article": displayable_article, "weak_match": weak_match,
+        }
+
+    return {
+        "status": "inconclusive", "articles_found": total_results,
+        "top_source": top_source, "top_article": displayable_article, "weak_match": weak_match,
+    }
+
+
+# ── Professional fact-check lookup via Google Fact Check Tools API ─────────
+# Searches published fact-checks (PolitiFact, Snopes, Reuters Fact Check,
+# etc.) for a claim matching this headline. This is a much stronger signal
+# than "does related news coverage exist" (NewsAPI above) — it's an actual
+# human-reviewed verdict on this specific claim, when one exists.
+GOOGLE_FACTCHECK_API_KEY = os.environ.get("GOOGLE_FACTCHECK_API_KEY")
+GOOGLE_FACTCHECK_URL = "https://factchecktools.googleapis.com/v1alpha1/claims:search"
+
+_FALSE_RATING_WORDS = {
+    "false", "fake", "pants on fire", "incorrect", "misleading", "hoax",
+    "fabricated", "unproven", "no evidence", "unsubstantiated", "debunked",
+    "not true", "mostly false", "distorts",
+}
+_TRUE_RATING_WORDS = {
+    "true", "correct", "accurate", "confirmed", "verified", "mostly true",
+    "real",
+}
+
+
+def _rating_to_status(rating: str) -> Optional[str]:
+    r = rating.lower().strip()
+    # Check false-ish phrases first since "mostly false" etc. contain "false"
+    # but some ratings mix words (e.g. "half true") — order matters.
+    if any(w in r for w in _FALSE_RATING_WORDS):
+        return "false"
+    if any(w in r for w in _TRUE_RATING_WORDS):
+        return "true"
+    if "half" in r or "mixture" in r or "mixed" in r or "partly" in r:
+        return "mixed"
+    return None
+
+
+async def google_fact_check(headline: str) -> Optional[dict]:
+    """
+    Look up this claim in Google's Fact Check Tools index. Returns None if
+    unavailable/no matching claim found, otherwise a dict with a normalized
+    status ("false" | "true" | "mixed") and the reviewing publisher/rating.
+    """
+    if not GOOGLE_FACTCHECK_API_KEY:
+        return None
+
+    terms = _extract_search_terms(headline, max_terms=8)
+    if len(terms) < 2:
+        return None
+    query = " ".join(terms)
+
+    try:
+        async with httpx.AsyncClient(timeout=6.0) as client:
+            resp = await client.get(
+                GOOGLE_FACTCHECK_URL,
+                params={"query": query, "languageCode": "en", "key": GOOGLE_FACTCHECK_API_KEY},
+            )
+        if resp.status_code != 200:
+            logger.warning("Google Fact Check API error %s: %s", resp.status_code, resp.text[:200])
+            return None
+        data = resp.json()
+    except Exception:
+        logger.exception("Google Fact Check API request failed")
+        return None
+
+    claims = data.get("claims", []) or []
+    entities, content_words = _extract_entities_and_content(headline)
+    term_set = {t.lower() for t in terms}
+    entity_set = {e.lower() for e in entities}
+    content_set = {c.lower() for c in content_words}
+    best_match = None
+    best_overlap = 0.0
+    for c in claims:
+        claim_text = (c.get("text") or "").lower()
+        hits = sum(1 for t in term_set if t in claim_text)
+        overlap = hits / len(term_set) if term_set else 0.0
+        reviews = c.get("claimReview") or []
+        if not reviews:
+            continue
+
+        # Guard against matching on shared entity mentions alone (e.g. a
+        # claim that starts "Former Indian captain Mahendra Singh Dhoni..."
+        # then disputes something totally unrelated, like a religious
+        # conversion rumor, while our headline just states his real,
+        # uncontested role). Find where the entity mentions end in the
+        # claim text and require our headline's own distinctive content
+        # word(s) — the actual assertion, not just who it's about — to
+        # appear in the remaining "predicate" text after that point.
+        if content_set:
+            last_entity_end = 0
+            for e in entity_set:
+                idx = claim_text.rfind(e)
+                if idx != -1:
+                    last_entity_end = max(last_entity_end, idx + len(e))
+            predicate_segment = claim_text[last_entity_end:]
+            # If the segment is too short to be meaningful (e.g. an entity
+            # word happens to sit right at the end of the sentence), fall
+            # back to checking the full claim text rather than risk a false
+            # rejection from an unlucky word order.
+            search_space = predicate_segment if len(predicate_segment) >= 15 else claim_text
+            if not any(w in search_space for w in content_set):
+                continue  # this claim disputes a different assertion entirely
+
+        if overlap > best_overlap:
+            best_overlap = overlap
+            best_match = (c, reviews[0])
+
+    # Require the matched claim's text to substantially overlap our headline
+    # so we don't apply an unrelated fact-check to this claim.
+    if not best_match or best_overlap < 0.5:
+        return None
+
+    claim, review = best_match
+    rating_text = review.get("textualRating", "") or ""
+    status = _rating_to_status(rating_text)
+    if status is None:
+        return None
+
+    return {
+        "status": status,
+        "rating": rating_text,
+        "publisher": (review.get("publisher") or {}).get("name", "a fact-checker"),
+        "url": review.get("url"),
+    }
+
+
+# ── Biographical grounding via Wikipedia's free REST API ───────────────────
+# NewsAPI/Google Fact Check need *recent* coverage of a claim to work — but
+# a huge share of fabricated headlines are about well-known people and don't
+# need "breaking news" at all (is this person alive? what was their actual
+# role?). Wikipedia is free, keyless, comprehensive for public figures, and
+# kept current, so it's a strong, independent second opinion specifically
+# for these biographical claims.
+_WIKI_SUMMARY_URL = "https://en.wikipedia.org/api/rest_v1/page/summary/{}"
+_WIKI_SEARCH_URL = "https://en.wikipedia.org/w/api.php"
+_WIKI_HEADERS = {"User-Agent": "clickbait-detector/1.0 (contact@example.com)"}
+
+_DEATH_CLAIM_WORDS = {"dead", "died", "death", "deceased", "passed"}
+_ALIVE_CLAIM_WORDS = {"alive", "living"}
+_WIKI_DEATH_INDICATORS = ("died", "death", "assassinat", "passed away", "deceased")
+
+
+def _extract_proper_noun_phrase(headline: str) -> Optional[str]:
+    """Find the longest run of consecutive capitalized words — the likely subject entity."""
+    words = headline.split()
+    best: list[str] = []
+    current: list[str] = []
+    for raw in words:
+        w = re.sub(r"[^\w'-]", "", raw)
+        is_cap = bool(w) and w[0].isupper() and w.lower() not in _STOPWORDS
+        if is_cap:
+            current.append(w)
+            if len(current) > len(best):
+                best = current[:]
+        else:
+            current = []
+    return " ".join(best) if best else None
+
+
+async def _wiki_fetch_summary(title: str) -> Optional[dict]:
+    try:
+        async with httpx.AsyncClient(timeout=6.0, headers=_WIKI_HEADERS) as client:
+            resp = await client.get(_WIKI_SUMMARY_URL.format(title.replace(" ", "_")))
+        if resp.status_code == 200:
+            return resp.json()
+    except Exception:
+        logger.exception("Wikipedia summary request failed")
+    return None
+
+
+async def _wikidata_has_death_date(qid: Optional[str]) -> Optional[bool]:
+    """
+    Query Wikidata's structured "date of death" property (P570) for this
+    entity. This is far more reliable than text-mining the Wikipedia summary
+    extract — for long, eventful biographies (heads of state, historical
+    figures) the death is often mentioned well past where the short summary
+    extract gets cut off, even though the structured data is always present.
+    Returns True/False when the entity is a known person with this property
+    resolvable, or None if it couldn't be determined either way.
+    """
+    if not qid:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=6.0, headers=_WIKI_HEADERS) as client:
+            resp = await client.get(
+                "https://www.wikidata.org/w/api.php",
+                params={
+                    "action": "wbgetclaims", "entity": qid, "property": "P570",
+                    "format": "json",
+                },
+            )
+        if resp.status_code != 200:
+            return None
+        claims = resp.json().get("claims", {})
+        return bool(claims.get("P570"))
+    except Exception:
+        logger.exception("Wikidata claims request failed")
+        return None
+
+
+async def wikipedia_check(headline: str) -> Optional[dict]:
+    """
+    Ground biographical claims (alive/dead status, occupation/role) against
+    Wikipedia. Returns None when no relevant, confidently-matched article
+    exists, otherwise a dict with status "contradicted" | "confirmed" |
+    "related" plus a human-readable note and source link.
+    """
+    subject = _extract_proper_noun_phrase(headline)
+    if not subject or len(subject) < 3:
+        return None
+
+    data = await _wiki_fetch_summary(subject)
+    if data is None:
+        # Try Wikipedia's own search to resolve nicknames/alternate spellings.
+        try:
+            async with httpx.AsyncClient(timeout=6.0, headers=_WIKI_HEADERS) as client:
+                resp = await client.get(_WIKI_SEARCH_URL, params={
+                    "action": "query", "list": "search", "srsearch": subject,
+                    "format": "json", "srlimit": 1,
+                })
+            if resp.status_code == 200:
+                hits = resp.json().get("query", {}).get("search", [])
+                if hits:
+                    data = await _wiki_fetch_summary(hits[0]["title"])
+        except Exception:
+            logger.exception("Wikipedia search request failed")
+
+    if not data or data.get("type") == "disambiguation":
+        return None
+
+    title = data.get("title") or subject
+    extract = (data.get("extract") or "").lower()
+    description = (data.get("description") or "").lower()
+    page_url = (data.get("content_urls", {}) or {}).get("desktop", {}).get("page")
+    qid = data.get("wikibase_item")
+    if not extract:
+        return None
+
+    # Guard against a bad search match resolving to an unrelated page — the
+    # resolved title must share a meaningful word with our extracted subject.
+    if not any(w in title.lower() for w in subject.lower().split() if len(w) > 2):
+        return None
+
+    headline_lower = headline.lower()
+    claims_dead = any(w in headline_lower for w in _DEATH_CLAIM_WORDS)
+    claims_alive = any(w in headline_lower for w in _ALIVE_CLAIM_WORDS) and not claims_dead
+
+    if claims_dead or claims_alive:
+        # Wikidata's structured "date of death" property is authoritative —
+        # unlike the short summary extract, it doesn't depend on the death
+        # being mentioned before the intro paragraph gets cut off.
+        wikidata_dead = await _wikidata_has_death_date(qid)
+        if wikidata_dead is not None:
+            wiki_reports_death = wikidata_dead
+        else:
+            # Fall back to text-based signals if Wikidata was unreachable.
+            has_death_year_range = bool(re.search(r"\(\s*\d{3,4}\s*[-–—]\s*\d{3,4}\s*\)", description))
+            wiki_reports_death = has_death_year_range or any(ind in extract for ind in _WIKI_DEATH_INDICATORS)
+    else:
+        wiki_reports_death = any(ind in extract for ind in _WIKI_DEATH_INDICATORS)
+
+    if claims_dead and not wiki_reports_death:
+        return {
+            "status": "contradicted",
+            "note": f"Wikipedia's article on {title} does not report them as deceased",
+            "title": title, "url": page_url,
+        }
+    if claims_dead and wiki_reports_death:
+        return {
+            "status": "confirmed",
+            "note": f"Wikipedia confirms {title} is deceased",
+            "title": title, "url": page_url,
+        }
+    if claims_alive and wiki_reports_death:
+        return {
+            "status": "contradicted",
+            "note": f"Wikipedia reports {title} as deceased",
+            "title": title, "url": page_url,
+        }
+
+    # Occupation/role corroboration — only ever a positive nudge, never a
+    # contradiction (a short Wikipedia description can't list every valid
+    # role/title a person has held, so absence isn't evidence of falsehood).
+    _, content_words = _extract_entities_and_content(headline)
+    remainder_words = {w.lower() for w in content_words if len(w) > 3}
+    bio_text = f"{description} {extract}"
+    if remainder_words and any(w in bio_text for w in remainder_words):
+        return {
+            "status": "related",
+            "note": f"Wikipedia's article on {title} corroborates this description",
+            "title": title, "url": page_url,
+        }
+
+    return None
 
 
 class PredictRequest(BaseModel):
@@ -29,13 +619,48 @@ class KeywordMatch(BaseModel):
     score: int
 
 
+class SourceRef(BaseModel):
+    label: str          # e.g. "Fact-check" or "News coverage"
+    title: str
+    url: Optional[str] = None
+    publisher: Optional[str] = None
+
+
+class StyleAnalysis(BaseModel):
+    """
+    Tier 1: writing-style analysis — rule-based heuristics + the TF-IDF/
+    structural-features ML model only. Answers "does this *read* like
+    clickbait?" and is completely independent of whether the claim is true.
+    """
+    verdict: str                 # CLICKBAIT_STYLE | NEUTRAL_STYLE | CREDIBLE_STYLE
+    clickbait_score: float        # 0-100
+    credible_score: float         # 0-100
+    indicators: list[str]
+    keywords: list[KeywordMatch]
+    model_used: str
+
+
+class FactCheckAnalysis(BaseModel):
+    """
+    Tier 2: real-world corroboration — NewsAPI coverage search, professional
+    fact-checker ratings (Google Fact Check), and Wikipedia grounding.
+    Answers "did this actually happen?" and never looks at headline phrasing.
+    """
+    status: str                   # see _FACTCHECK_STATUSES below
+    note: Optional[str] = None
+    sources: list[SourceRef] = []
+
+
 class PredictResponse(BaseModel):
     verdict: str
     confidence: float
     scores: dict
     indicators: list[str]
     keywords: list[KeywordMatch]
+    sources: list[SourceRef] = []
     model_used: str
+    style_analysis: Optional[StyleAnalysis] = None
+    fact_check: Optional[FactCheckAnalysis] = None
 
 
 class StatusResponse(BaseModel):
@@ -43,14 +668,145 @@ class StatusResponse(BaseModel):
     model_name: str
     feedback_count: int
     last_retrained: Optional[str]
+    gemini_examples_used: int = 0
+    gemini_accuracy: Optional[float] = None
+    groq_examples_used: int = 0
+    groq_accuracy: Optional[float] = None
+    teacher_examples_used: int = 0
+    teacher_accuracy: Optional[float] = None
+    ready_for_local_only: bool = False
+
+
+def _load_model_from_disk() -> None:
+    """(Re)load the trained model artifact from disk into memory."""
+    global model_name, ml_vectorizer, ml_classifier, model_feedback_examples_used, model_last_retrained
+    global model_gemini_examples_used, model_gemini_accuracy
+    global model_groq_examples_used, model_groq_accuracy
+    global model_teacher_examples_used, model_teacher_accuracy
+    if not os.path.exists(MODEL_PATH):
+        logger.info("No trained model found at %s — using rule-based classifier only", MODEL_PATH)
+        return
+    try:
+        bundle = joblib.load(MODEL_PATH)
+        ml_vectorizer = bundle["vectorizer"]
+        ml_classifier = bundle["classifier"]
+        model_name = f"{bundle.get('model_name', 'tfidf-logreg-v1')}+rules"
+        model_feedback_examples_used = bundle.get("feedback_examples_used", 0)
+        model_gemini_examples_used = bundle.get("gemini_examples_used", 0)
+        model_gemini_accuracy = bundle.get("gemini_accuracy")
+        model_groq_examples_used = bundle.get("groq_examples_used", 0)
+        model_groq_accuracy = bundle.get("groq_accuracy")
+        model_teacher_examples_used = bundle.get(
+            "teacher_examples_used", model_gemini_examples_used + model_groq_examples_used
+        )
+        model_teacher_accuracy = bundle.get("teacher_accuracy")
+        trained_at = bundle.get("trained_at")
+        model_last_retrained = (
+            datetime.fromtimestamp(trained_at, tz=timezone.utc).isoformat() if trained_at else None
+        )
+        logger.info(
+            "Loaded model from %s (test accuracy=%.4f, feedback_examples=%d, "
+            "gemini_examples=%d, gemini_accuracy=%s, groq_examples=%d, groq_accuracy=%s, teacher_accuracy=%s)",
+            MODEL_PATH, bundle.get("accuracy", float("nan")), model_feedback_examples_used,
+            model_gemini_examples_used,
+            f"{model_gemini_accuracy:.4f}" if model_gemini_accuracy is not None else "n/a",
+            model_groq_examples_used,
+            f"{model_groq_accuracy:.4f}" if model_groq_accuracy is not None else "n/a",
+            f"{model_teacher_accuracy:.4f}" if model_teacher_accuracy is not None else "n/a",
+        )
+    except Exception:
+        logger.exception("Failed to load trained model, falling back to rule-based only")
+        ml_vectorizer = None
+        ml_classifier = None
+        model_name = "rule-based-v3"
+
+
+# ── Contextual embeddings (fine-tuned DistilBERT) ───────────────────────────
+# Optional upgrade over pure TF-IDF: a Transformer actually understands
+# sentence semantics, which generalizes better to headlines whose *phrasing*
+# the TF-IDF model has seen before but whose *vocabulary* (e.g. new
+# entities/names) it hasn't. Loaded only if a fine-tuned artifact exists on
+# disk (see train_distilbert.py) — the service runs fine without it, falling
+# back to the TF-IDF+structural+rules pipeline exactly as before.
+TRANSFORMER_MODEL_DIR = os.path.join(HERE, "models", "distilbert_clickbait")
+TRANSFORMER_MAX_LENGTH = 48
+transformer_tokenizer = None
+transformer_model = None
+transformer_ready = False
+
+
+def _load_transformer_model() -> None:
+    """Load the fine-tuned DistilBERT model if a trained artifact exists on disk."""
+    global transformer_tokenizer, transformer_model, transformer_ready, model_name
+    if not os.path.isfile(os.path.join(TRANSFORMER_MODEL_DIR, "config.json")):
+        logger.info("No fine-tuned DistilBERT model found at %s — skipping", TRANSFORMER_MODEL_DIR)
+        return
+    try:
+        from transformers import DistilBertForSequenceClassification, DistilBertTokenizerFast
+        transformer_tokenizer = DistilBertTokenizerFast.from_pretrained(TRANSFORMER_MODEL_DIR)
+        transformer_model = DistilBertForSequenceClassification.from_pretrained(TRANSFORMER_MODEL_DIR)
+        transformer_model.eval()
+        transformer_ready = True
+        model_name = f"{model_name}+distilbert"
+        logger.info("Loaded fine-tuned DistilBERT model from %s", TRANSFORMER_MODEL_DIR)
+    except Exception:
+        logger.exception("Failed to load DistilBERT model — continuing without it")
+        transformer_tokenizer = None
+        transformer_model = None
+        transformer_ready = False
+
+
+def transformer_predict_proba(headline: str) -> Optional[float]:
+    """Return P(clickbait) from the fine-tuned DistilBERT model, or None if unavailable."""
+    if not transformer_ready or transformer_model is None or transformer_tokenizer is None:
+        return None
+    try:
+        import torch
+        with torch.no_grad():
+            enc = transformer_tokenizer(
+                headline, truncation=True, padding="max_length",
+                max_length=TRANSFORMER_MAX_LENGTH, return_tensors="pt",
+            )
+            logits = transformer_model(**enc).logits
+            probs = torch.softmax(logits, dim=-1)[0]
+            return float(probs[1].item())
+    except Exception:
+        logger.exception("DistilBERT inference failed — falling back to TF-IDF model only")
+        return None
+
+
+async def _retrain_loop() -> None:
+    """
+    Background task: periodically retrains the model on the original dataset
+    plus any newly accumulated, majority-agreed user feedback, then hot-swaps
+    the in-memory model — real continuous learning instead of a one-time
+    static artifact.
+    """
+    import asyncio
+    from retrain import retrain as retrain_model
+
+    while True:
+        await asyncio.sleep(RETRAIN_INTERVAL_SECONDS)
+        if not DATABASE_URL:
+            continue
+        try:
+            await asyncio.to_thread(retrain_model, DATABASE_URL)
+            _load_model_from_disk()
+            _load_transformer_model()
+        except Exception:
+            logger.exception("Scheduled retraining failed — keeping previous model")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    import asyncio
     global model_ready
-    logger.info("Rule-based classifier v3 ready — instant startup, no model download")
+    _load_model_from_disk()
+    _load_transformer_model()
     model_ready = True
+    task = asyncio.create_task(_retrain_loop())
     yield
+    task.cancel()
 
 
 app = FastAPI(title="News Credibility ML Service", version="3.0.0", lifespan=lifespan)
@@ -495,7 +1251,57 @@ def extract_indicators(
     return indicators if indicators else ["No strong signals detected — content appears neutral"]
 
 
-def predict(headline: str, body: Optional[str]) -> PredictResponse:
+def ml_predict_proba(headline: str) -> Optional[float]:
+    """Return P(clickbait) from the trained TF-IDF+LogReg model, or None if unavailable."""
+    if ml_vectorizer is None or ml_classifier is None:
+        return None
+    vec = ml_vectorizer.transform([headline])
+    # classifier.classes_ is [0, 1] where 1 == clickbait
+    return float(ml_classifier.predict_proba(vec)[0][1])
+
+
+# Body carries real signal but should never outweigh the headline — the model
+# was trained on headlines only, so the body's contribution is capped at 25%.
+BODY_ML_WEIGHT = 0.25
+HEADLINE_ML_WEIGHT = 1.0 - BODY_ML_WEIGHT
+
+# When the fine-tuned DistilBERT model is available, it gets more weight than
+# the TF-IDF+structural model in the headline-style score — contextual
+# embeddings understand sentence semantics, so they should generalize better
+# to phrasing/vocabulary combinations neither model saw during training.
+TRANSFORMER_HEADLINE_WEIGHT = 0.6
+TFIDF_HEADLINE_WEIGHT = 1.0 - TRANSFORMER_HEADLINE_WEIGHT
+
+
+def ml_predict_combined(headline: str, body: Optional[str]) -> Optional[float]:
+    """Blend the headline-only model score(s) with a body-only score (if body given)."""
+    p_tfidf = ml_predict_proba(headline)
+    p_transformer = transformer_predict_proba(headline)
+    if p_tfidf is None and p_transformer is None:
+        return None
+    if p_tfidf is not None and p_transformer is not None:
+        p_headline = TFIDF_HEADLINE_WEIGHT * p_tfidf + TRANSFORMER_HEADLINE_WEIGHT * p_transformer
+    else:
+        p_headline = p_transformer if p_transformer is not None else p_tfidf
+
+    body_text = (body or "").strip()
+    if not body_text:
+        return p_headline
+    # DistilBERT isn't applied to the (potentially long) body — too slow for
+    # the inference path; the TF-IDF model handles body scoring as before.
+    p_body = ml_predict_proba(body_text[:1000])
+    if p_body is None:
+        return p_headline
+    return HEADLINE_ML_WEIGHT * p_headline + BODY_ML_WEIGHT * p_body
+
+
+def predict(
+    headline: str,
+    body: Optional[str],
+    fact_result: Optional[dict],
+    verified_result: Optional[dict] = None,
+    wiki_result: Optional[dict] = None,
+) -> PredictResponse:
     # ── Rule-based scoring ─────────────────────────────────────────────────
     # Clickbait: headline 100%, body 25% (body rarely contains bait)
     cb_hl   = score_patterns(headline, CB_SCORED)
@@ -542,16 +1348,219 @@ def predict(headline: str, body: Optional[str]) -> PredictResponse:
         p_real_final = 0.60
         p_cb_final   = 0.40
 
+    # ── Blend in the trained ML model (if available) ───────────────────────
+    p_cb_ml = ml_predict_combined(headline, body)
+    if p_cb_ml is not None:
+        p_cb_final   = ML_WEIGHT * p_cb_ml + RULE_WEIGHT * p_cb_final
+        p_real_final = 1.0 - p_cb_final
+
+    # ── Tier 1 snapshot: pure writing-style verdict ─────────────────────────
+    # Captured here, before any fact-check/corroboration signal is blended
+    # in below, so it reflects *only* headline/body phrasing — never whether
+    # the underlying claim is actually true. Exposed separately in the API
+    # response as `style_analysis` (see "Decouple style vs fact checking").
+    style_indicators = extract_indicators(headline, body, p_cb_final, p_real_final)
+    style_keywords = extract_keywords(headline, body)
+    style_verdict = (
+        "CLICKBAIT_STYLE" if p_cb_final > 0.58
+        else "CREDIBLE_STYLE" if p_real_final > 0.58
+        else "NEUTRAL_STYLE"
+    )
+    style_analysis = StyleAnalysis(
+        verdict=style_verdict,
+        clickbait_score=round(p_cb_final * 100, 1),
+        credible_score=round(p_real_final * 100, 1),
+        indicators=style_indicators,
+        keywords=style_keywords,
+        model_used=model_name,
+    )
+
+    # ── Blend in real-world fact-check corroboration (if available) ───────
+    factcheck_note: Optional[str] = None
+    sources: list[SourceRef] = []
+    if fact_result is not None:
+        status = fact_result["status"]
+        top_article = fact_result.get("top_article")
+        weak_match = fact_result.get("weak_match", False)
+        news_label = "Possibly related article (unverified — please check yourself)" if weak_match else "News coverage"
+        if status == "corroborated":
+            p_cb_factcheck = 0.08
+            p_cb_final = 0.55 * p_cb_final + 0.45 * p_cb_factcheck
+            p_real_final = 1.0 - p_cb_final
+            source_note = f" (e.g. {fact_result['top_source']})" if fact_result.get("top_source") else ""
+            factcheck_note = f"Corroborated by {fact_result['articles_found']} real news article(s){source_note}"
+            if top_article and top_article.get("title"):
+                sources.append(SourceRef(
+                    label=news_label, title=top_article["title"],
+                    url=top_article.get("url"), publisher=top_article.get("publisher"),
+                ))
+        elif status == "partially_corroborated":
+            p_cb_factcheck = 0.15
+            p_cb_final = 0.5 * p_cb_final + 0.5 * p_cb_factcheck
+            p_real_final = 1.0 - p_cb_final
+            source_note = f" (e.g. {fact_result['top_source']})" if fact_result.get("top_source") else ""
+            factcheck_note = f"Found closely related real news coverage{source_note} supporting this claim"
+            if top_article and top_article.get("title"):
+                sources.append(SourceRef(
+                    label=news_label, title=top_article["title"],
+                    url=top_article.get("url"), publisher=top_article.get("publisher"),
+                ))
+        elif status == "no_coverage":
+            p_cb_factcheck = 0.8
+            p_cb_final = 0.5 * p_cb_final + 0.5 * p_cb_factcheck
+            p_real_final = 1.0 - p_cb_final
+            factcheck_note = "No corroborating news coverage found for this claim — may be unverified or fabricated"
+        elif status == "unconfirmed_claim":
+            # The subject is real/newsworthy, but none of the actual coverage
+            # about them supports this specific claim — a strong hoax signal
+            # (e.g. a celebrity/politician "death" claim with no matching
+            # obituary or news story anywhere).
+            p_cb_factcheck = 0.92
+            p_cb_final = 0.3 * p_cb_final + 0.7 * p_cb_factcheck
+            p_real_final = 1.0 - p_cb_final
+            source_note = f" (e.g. {fact_result['top_source']})" if fact_result.get("top_source") else ""
+            factcheck_note = (
+                f"Found {fact_result['articles_found']} article(s) about this subject{source_note}, "
+                "but none report this specific claim — likely false or unverified"
+            )
+            if top_article and top_article.get("title"):
+                sources.append(SourceRef(
+                    label="Related coverage (claim not found in it)", title=top_article["title"],
+                    url=top_article.get("url"), publisher=top_article.get("publisher"),
+                ))
+        elif status == "inconclusive":
+            factcheck_note = f"Found {fact_result['articles_found']} loosely related article(s) — corroboration inconclusive"
+            if top_article and top_article.get("title"):
+                sources.append(SourceRef(
+                    label="Loosely related article — verify yourself", title=top_article["title"],
+                    url=top_article.get("url"), publisher=top_article.get("publisher"),
+                ))
+
     verdict  = "CLICKBAIT" if p_cb_final > 0.5 else "REAL"
     raw_conf = p_cb_final if verdict == "CLICKBAIT" else p_real_final
+    verified_note: Optional[str] = None
 
-    if has_signals:
+    # ── Professional fact-check verdict (if found) — takes top priority ────
+    # A human-reviewed rating on this exact claim beats every heuristic
+    # signal above, since it's an actual verified answer, not an inference.
+    if verified_result is not None:
+        vstatus = verified_result["status"]
+        publisher = verified_result.get("publisher", "a fact-checker")
+        rating = verified_result.get("rating", "")
+        if vstatus == "false":
+            verdict = "CLICKBAIT"
+            p_cb_final, p_real_final = 0.95, 0.05
+            raw_conf = 0.95
+            verified_note = f"Fact-checked by {publisher}: rated \"{rating}\" — this specific claim has been reviewed and found false"
+        elif vstatus == "true":
+            verdict = "REAL"
+            p_cb_final, p_real_final = 0.05, 0.95
+            raw_conf = 0.95
+            verified_note = f"Fact-checked by {publisher}: rated \"{rating}\" — this specific claim has been verified"
+        elif vstatus == "mixed":
+            verified_note = f"Fact-checked by {publisher}: rated \"{rating}\" — partially true, treat with caution"
+        if verified_result.get("url"):
+            sources.insert(0, SourceRef(
+                label="Fact-check", title=f"Rated \"{rating}\" by {publisher}",
+                url=verified_result.get("url"), publisher=publisher,
+            ))
+
+    # ── Wikipedia biographical grounding (alive/dead) — quiet secondary
+    # signal only. Per design choice: Wikipedia is user-editable and not a
+    # news source, so it never appears in the "sources" evidence list and
+    # can never single-handedly force a confident verdict. Real, credible
+    # news coverage (NewsAPI / Google Fact Check) always takes priority —
+    # this only nudges the score, and only when no decisive news signal
+    # already exists.
+    real_news_decisive = verified_result is not None or (
+        fact_result is not None and fact_result["status"] in (
+            "corroborated", "no_coverage", "unconfirmed_claim", "partially_corroborated",
+        )
+    )
+    if not real_news_decisive and wiki_result is not None:
+        wstatus = wiki_result["status"]
+        if wstatus == "contradicted":
+            p_cb_wiki = 0.75
+            p_cb_final = 0.55 * p_cb_final + 0.45 * p_cb_wiki
+            p_real_final = 1.0 - p_cb_final
+            if not factcheck_note:
+                factcheck_note = f"{wiki_result['note']} — treat with caution (not independently confirmed by news coverage)"
+        elif wstatus == "confirmed":
+            p_cb_wiki = 0.25
+            p_cb_final = 0.55 * p_cb_final + 0.45 * p_cb_wiki
+            p_real_final = 1.0 - p_cb_final
+            if not factcheck_note:
+                factcheck_note = f"{wiki_result['note']} — for reference only, not a verified news report"
+        elif wstatus == "related" and not factcheck_note:
+            p_cb_final = 0.7 * p_cb_final + 0.3 * 0.3
+            p_real_final = 1.0 - p_cb_final
+        if verified_result is None:
+            # Re-derive the verdict/confidence now that the wiki nudge has
+            # been folded in (verified_result, when present, already fixed
+            # these above and takes priority over this secondary signal).
+            verdict  = "CLICKBAIT" if p_cb_final > 0.5 else "REAL"
+            raw_conf = p_cb_final if verdict == "CLICKBAIT" else p_real_final
+
+    # ── Tier 2 status label exposed in the API response ────────────────────
+    if verified_result is not None:
+        fact_tier_status = f"fact_checked_{verified_result['status']}"  # fact_checked_true/false/mixed
+    elif fact_result is not None:
+        fact_tier_status = fact_result["status"]
+    elif wiki_result is not None:
+        fact_tier_status = f"wiki_{wiki_result['status']}"
+    else:
+        fact_tier_status = "not_checked"
+
+    fact_check_analysis = FactCheckAnalysis(
+        status=fact_tier_status,
+        note=verified_note or factcheck_note,
+        sources=sources,
+    )
+
+    # ── Admit uncertainty rather than force a confident guess ──────────────
+    # If no professional fact-check exists, no fact-check API signal was
+    # decisive, and the model+rules genuinely can't separate REAL/CLICKBAIT
+    # (near a coin-flip), it is more honest to say so than to output a
+    # confident-sounding but essentially random verdict.
+    decisive_factcheck = fact_result is not None and fact_result["status"] in (
+        "corroborated", "no_coverage", "unconfirmed_claim", "partially_corroborated",
+    )
+    if verified_result is None and not decisive_factcheck and raw_conf < 0.58:
+        verdict = "UNCERTAIN"
+        confidence = round(50 + abs(p_cb_final - 0.5) * 100, 1)
+        indicators = extract_indicators(headline, body, p_cb_final, p_real_final)
+        indicators.insert(
+            0,
+            "Not enough evidence (writing style or independent news coverage) to confidently verify this "
+            "claim — treat it with caution and check a trusted source",
+        )
+        keywords = extract_keywords(headline, body)
+        return PredictResponse(
+            verdict=verdict,
+            confidence=confidence,
+            scores={
+                "real":      round(p_real_final * 100, 1),
+                "clickbait": round(p_cb_final   * 100, 1),
+            },
+            indicators=indicators,
+            keywords=keywords,
+            sources=sources,
+            model_used=model_name,
+            style_analysis=style_analysis,
+            fact_check=fact_check_analysis,
+        )
+
+    if has_signals or p_cb_ml is not None or fact_result is not None or verified_result is not None or wiki_result is not None:
         confidence = round(max(54.0, min(97.0, raw_conf * 100)), 1)
     else:
         # Neutral — stay humble about confidence
         confidence = round(max(54.0, min(68.0, raw_conf * 100)), 1)
 
     indicators = extract_indicators(headline, body, p_cb_final, p_real_final)
+    if verified_note:
+        indicators.insert(0, verified_note)
+    elif factcheck_note:
+        indicators.insert(0, factcheck_note)
     keywords   = extract_keywords(headline, body)
 
     return PredictResponse(
@@ -563,7 +1572,10 @@ def predict(headline: str, body: Optional[str]) -> PredictResponse:
         },
         indicators=indicators,
         keywords=keywords,
+        sources=sources,
         model_used=model_name,
+        style_analysis=style_analysis,
+        fact_check=fact_check_analysis,
     )
 
 
@@ -571,7 +1583,12 @@ def predict(headline: str, body: Optional[str]) -> PredictResponse:
 async def predict_route(req: PredictRequest):
     if not model_ready:
         raise HTTPException(status_code=503, detail="Model not ready yet, please retry")
-    return predict(req.headline, req.body)
+    fact_result, verified_result, wiki_result = await asyncio.gather(
+        fact_check_headline(req.headline),
+        google_fact_check(req.headline),
+        wikipedia_check(req.headline),
+    )
+    return predict(req.headline, req.body, fact_result, verified_result, wiki_result)
 
 
 @app.get("/status", response_model=StatusResponse)
@@ -579,8 +1596,41 @@ async def status_route():
     return StatusResponse(
         ready=model_ready,
         model_name=model_name,
-        feedback_count=0,
-        last_retrained=None,
+        feedback_count=model_feedback_examples_used,
+        last_retrained=model_last_retrained,
+        gemini_examples_used=model_gemini_examples_used,
+        gemini_accuracy=model_gemini_accuracy,
+        groq_examples_used=model_groq_examples_used,
+        groq_accuracy=model_groq_accuracy,
+        teacher_examples_used=model_teacher_examples_used,
+        teacher_accuracy=model_teacher_accuracy,
+        ready_for_local_only=_is_ready_for_local_only(),
+    )
+
+
+@app.post("/retrain", response_model=StatusResponse)
+async def retrain_route():
+    """Manually trigger an immediate retrain from current feedback (normally runs on a timer)."""
+    import asyncio
+    from retrain import retrain as retrain_model
+
+    if not DATABASE_URL:
+        raise HTTPException(status_code=400, detail="DATABASE_URL not configured — cannot retrain from feedback")
+    await asyncio.to_thread(retrain_model, DATABASE_URL)
+    _load_model_from_disk()
+    _load_transformer_model()
+    return StatusResponse(
+        ready=model_ready,
+        model_name=model_name,
+        feedback_count=model_feedback_examples_used,
+        last_retrained=model_last_retrained,
+        gemini_examples_used=model_gemini_examples_used,
+        gemini_accuracy=model_gemini_accuracy,
+        groq_examples_used=model_groq_examples_used,
+        groq_accuracy=model_groq_accuracy,
+        teacher_examples_used=model_teacher_examples_used,
+        teacher_accuracy=model_teacher_accuracy,
+        ready_for_local_only=_is_ready_for_local_only(),
     )
 
 

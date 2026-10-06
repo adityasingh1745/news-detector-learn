@@ -12,4 +12,27 @@ export interface MlStatus {
   feedbackCount: number;
   /** @nullable */
   lastRetrained: string | null;
+  /** Number of Gemini-labeled analyses folded into the local model's training data so far. */
+  geminiExamplesUsed?: number;
+  /**
+     * Local model's accuracy at reproducing Gemini's labels on a held-out test split.
+     * @nullable
+     */
+  geminiAccuracy?: number | null;
+  /** Number of Groq-labeled analyses folded into the local model's training data so far. */
+  groqExamplesUsed?: number;
+  /**
+     * Local model's accuracy at reproducing Groq's labels on a held-out test split.
+     * @nullable
+     */
+  groqAccuracy?: number | null;
+  /** Combined number of Gemini + Groq labeled examples folded into the local model's training data. */
+  teacherExamplesUsed?: number;
+  /**
+     * Local model's combined accuracy at reproducing Gemini + Groq labels on a held-out test split; this is what graduation is based on.
+     * @nullable
+     */
+  teacherAccuracy?: number | null;
+  /** True once the local model has distilled enough Gemini/Groq-labeled examples accurately enough that neither API is needed for new classifications. */
+  readyForLocalOnly?: boolean;
 }

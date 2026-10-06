@@ -9,6 +9,7 @@
 export * from './analysisResult';
 export * from './analysisResultVerdict';
 export * from './errorResponse';
+export * from './factCheckAnalysis';
 export * from './feedbackInput';
 export * from './feedbackInputCorrectLabel';
 export * from './feedbackResult';
@@ -20,5 +21,8 @@ export * from './keywordMatch';
 export * from './mlStatus';
 export * from './newsInput';
 export * from './scoreBreakdown';
+export * from './sourceRef';
 export * from './stats';
+export * from './styleAnalysis';
+export * from './styleAnalysisVerdict';
 export * from './verdictCounts';

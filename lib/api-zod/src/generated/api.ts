@@ -34,7 +34,7 @@ export const AnalyzeNewsResponse = zod.object({
   "id": zod.number(),
   "headline": zod.string(),
   "body": zod.string().nullish(),
-  "verdict": zod.enum(['REAL', 'CLICKBAIT']).describe('Final verdict'),
+  "verdict": zod.enum(['REAL', 'CLICKBAIT', 'UNCERTAIN']).describe('Final verdict. UNCERTAIN means there wasn\'t enough evidence to confidently call it REAL or CLICKBAIT.'),
   "confidence": zod.number().describe('Confidence score 0-100 for the verdict'),
   "scores": zod.object({
   "real": zod.number().describe('Probability score 0-100 for REAL'),
@@ -46,7 +46,34 @@ export const AnalyzeNewsResponse = zod.object({
   "keywords": zod.array(zod.object({
   "word": zod.string().describe('The exact word or phrase matched in the text'),
   "score": zod.number().describe('Severity score 0-100 for this specific keyword signal')
-})).optional().describe('Clickbait signals found in the text with per-keyword severity scores')
+})).optional().describe('Clickbait signals found in the text with per-keyword severity scores'),
+  "sources": zod.array(zod.object({
+  "label": zod.string().describe('What this source represents, e.g. \"Fact-check\" or \"News coverage\"'),
+  "title": zod.string().describe('The article\/fact-check title'),
+  "url": zod.string().nullish().describe('Link to the original source'),
+  "publisher": zod.string().nullish().describe('The outlet\/publisher name')
+})).optional().describe('Real articles or fact-checks found while verifying this claim, if any'),
+  "styleAnalysis": zod.object({
+  "verdict": zod.enum(['CLICKBAIT_STYLE', 'NEUTRAL_STYLE', 'CREDIBLE_STYLE']),
+  "clickbaitScore": zod.number().describe('0-100 writing-style clickbait score'),
+  "credibleScore": zod.number().describe('0-100 writing-style credibility score'),
+  "indicators": zod.array(zod.string()),
+  "keywords": zod.array(zod.object({
+  "word": zod.string().describe('The exact word or phrase matched in the text'),
+  "score": zod.number().describe('Severity score 0-100 for this specific keyword signal')
+})),
+  "modelUsed": zod.string()
+}).optional().describe('Tier 1 — writing-style verdict from rules + the TF-IDF\/structural ML model only, independent of whether the claim is factually true.\n'),
+  "factCheck": zod.object({
+  "status": zod.string().describe('corroborated | partially_corroborated | no_coverage | unconfirmed_claim | inconclusive | fact_checked_true | fact_checked_false | fact_checked_mixed | wiki_confirmed | wiki_contradicted | wiki_related | not_checked\n'),
+  "note": zod.string().nullish(),
+  "sources": zod.array(zod.object({
+  "label": zod.string().describe('What this source represents, e.g. \"Fact-check\" or \"News coverage\"'),
+  "title": zod.string().describe('The article\/fact-check title'),
+  "url": zod.string().nullish().describe('Link to the original source'),
+  "publisher": zod.string().nullish().describe('The outlet\/publisher name')
+})).optional()
+}).optional().describe('Tier 2 — real-world corroboration from news search, professional fact-checkers, and Wikipedia; never looks at headline phrasing.\n')
 })
 
 
@@ -73,7 +100,7 @@ export const GetHistoryQueryParams = zod.object({
 export const GetHistoryResponseItem = zod.object({
   "id": zod.number(),
   "headline": zod.string(),
-  "verdict": zod.enum(['REAL', 'CLICKBAIT']),
+  "verdict": zod.enum(['REAL', 'CLICKBAIT', 'UNCERTAIN']),
   "confidence": zod.number(),
   "analyzedAt": zod.string(),
   "hasFeedback": zod.boolean().optional()
@@ -89,7 +116,8 @@ export const GetStatsResponse = zod.object({
   "totalAnalyzed": zod.number(),
   "verdictCounts": zod.object({
   "REAL": zod.number(),
-  "CLICKBAIT": zod.number()
+  "CLICKBAIT": zod.number(),
+  "UNCERTAIN": zod.number()
 }),
   "avgConfidence": zod.number(),
   "totalFeedback": zod.number(),
@@ -105,7 +133,33 @@ export const GetMlStatusResponse = zod.object({
   "ready": zod.boolean(),
   "modelName": zod.string(),
   "feedbackCount": zod.number(),
-  "lastRetrained": zod.string().nullable()
+  "lastRetrained": zod.string().nullable(),
+  "geminiExamplesUsed": zod.number().optional().describe('Number of Gemini-labeled analyses folded into the local model\'s training data so far.'),
+  "geminiAccuracy": zod.number().nullish().describe('Local model\'s accuracy at reproducing Gemini\'s labels on a held-out test split.'),
+  "groqExamplesUsed": zod.number().optional().describe('Number of Groq-labeled analyses folded into the local model\'s training data so far.'),
+  "groqAccuracy": zod.number().nullish().describe('Local model\'s accuracy at reproducing Groq\'s labels on a held-out test split.'),
+  "teacherExamplesUsed": zod.number().optional().describe('Combined number of Gemini + Groq labeled examples folded into the local model\'s training data.'),
+  "teacherAccuracy": zod.number().nullish().describe('Local model\'s combined accuracy at reproducing Gemini + Groq labels on a held-out test split; this is what graduation is based on.'),
+  "readyForLocalOnly": zod.boolean().optional().describe('True once the local model has distilled enough Gemini\/Groq-labeled examples accurately enough that neither API is needed for new classifications.')
+})
+
+
+/**
+ * Normally runs automatically every few hours. Triggers it immediately so newly accumulated Gemini-labeled examples and user feedback are folded into the local model without waiting for the schedule.
+ * @summary Manually trigger an immediate model retrain
+ */
+export const TriggerRetrainResponse = zod.object({
+  "ready": zod.boolean(),
+  "modelName": zod.string(),
+  "feedbackCount": zod.number(),
+  "lastRetrained": zod.string().nullable(),
+  "geminiExamplesUsed": zod.number().optional().describe('Number of Gemini-labeled analyses folded into the local model\'s training data so far.'),
+  "geminiAccuracy": zod.number().nullish().describe('Local model\'s accuracy at reproducing Gemini\'s labels on a held-out test split.'),
+  "groqExamplesUsed": zod.number().optional().describe('Number of Groq-labeled analyses folded into the local model\'s training data so far.'),
+  "groqAccuracy": zod.number().nullish().describe('Local model\'s accuracy at reproducing Groq\'s labels on a held-out test split.'),
+  "teacherExamplesUsed": zod.number().optional().describe('Combined number of Gemini + Groq labeled examples folded into the local model\'s training data.'),
+  "teacherAccuracy": zod.number().nullish().describe('Local model\'s combined accuracy at reproducing Gemini + Groq labels on a held-out test split; this is what graduation is based on.'),
+  "readyForLocalOnly": zod.boolean().optional().describe('True once the local model has distilled enough Gemini\/Groq-labeled examples accurately enough that neither API is needed for new classifications.')
 })
 
 

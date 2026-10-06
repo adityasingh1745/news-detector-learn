@@ -66,6 +66,11 @@ export default defineConfig({
     fs: {
       strict: true,
     },
+    // Proxy API calls to the Node.js API server during local development,
+    // since the frontend issues relative "/api/..." requests.
+    proxy: {
+      "/api": process.env.API_PROXY_TARGET || "http://localhost:8080",
+    },
   },
   preview: {
     port,
