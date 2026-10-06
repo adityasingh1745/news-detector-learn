@@ -61,8 +61,10 @@ Thumbs.db
 /archive (2)/
 /Clickbait-Detection-main/
 
-# Trained ML model artifacts (regenerated on the ML host / HF Space)
-services/ml-api/models/
+# Unused DistilBERT experiment artifacts (not loaded by main.py; large).
+# The small, actually-used clickbait_model.joblib IS tracked.
+services/ml-api/models/distilbert_clickbait/
+services/ml-api/models/distilbert_clickbait_backup_curated/
 services/ml-api/__pycache__/
 **/__pycache__/
 

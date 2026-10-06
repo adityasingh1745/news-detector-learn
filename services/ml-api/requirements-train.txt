@@ -1,0 +1,5 @@
+# Extra dependencies needed only to run train_distilbert.py locally.
+# Not installed on the deployed service (see requirements.txt).
+-r requirements.txt
+transformers==4.47.1
+torch==2.5.1

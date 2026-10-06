@@ -1,0 +1,11 @@
+{
+  "buildCommand": "cd ../.. && pnpm install --frozen-lockfile=false && pnpm --filter @workspace/news-detector... build",
+  "outputDirectory": "dist/public",
+  "installCommand": "echo skip",
+  "rewrites": [
+    {
+      "source": "/api/:path*",
+      "destination": "https://news-detector-api.onrender.com/api/:path*"
+    }
+  ]
+}

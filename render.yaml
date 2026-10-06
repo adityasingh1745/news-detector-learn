@@ -1,0 +1,44 @@
+services:
+  # Node/Express API server — wraps the ML service + Gemini/Groq fallback
+  # pipeline and talks to Postgres. Needs a persistent process (not
+  # serverless) since it will later host periodic/background work.
+  - type: web
+    name: news-detector-api
+    runtime: node
+    plan: free
+    region: oregon
+    rootDir: .
+    buildCommand: pnpm install --frozen-lockfile=false && pnpm --filter @workspace/api-server... build
+    startCommand: node artifacts/api-server/dist/index.mjs
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: ML_SERVICE_URL
+        value: https://news-detector-ml.onrender.com
+      - key: DATABASE_URL
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: NEWS_API_KEY
+        sync: false
+
+  # Python FastAPI ML service (TF-IDF + Logistic Regression + rule-based
+  # scoring). Runs a background retrain loop, so it also needs a
+  # persistent process rather than a serverless function.
+  - type: web
+    name: news-detector-ml
+    runtime: python
+    plan: free
+    region: oregon
+    rootDir: services/ml-api
+    buildCommand: pip install -r requirements.txt
+    startCommand: bash -c "ML_PORT=$PORT python main.py"
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: NEWS_API_KEY
+        sync: false
+      - key: GOOGLE_FACTCHECK_API_KEY
+        sync: false

@@ -1,7 +1,10 @@
+# Note: `transformers`/`torch` were removed from this deploy-time file —
+# main.py's live /predict path only uses the TF-IDF + LogReg joblib model
+# plus rule-based scoring, not the DistilBERT experiments in
+# train_distilbert.py. See requirements-train.txt if you need to run that
+# script locally.
 fastapi==0.115.6
 uvicorn[standard]==0.32.1
-transformers==4.47.1
-torch==2.5.1
 pydantic==2.10.3
 httpx==0.28.1
 scikit-learn==1.9.1
