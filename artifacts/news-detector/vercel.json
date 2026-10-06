@@ -1,11 +1,7 @@
 {
-  "buildCommand": "cd ../.. && pnpm install --frozen-lockfile=false && pnpm --filter @workspace/news-detector... build",
+  "buildCommand": "cd ../.. && pnpm install --frozen-lockfile=false && PORT=3000 BASE_PATH=/ pnpm --filter @workspace/news-detector... build",
   "outputDirectory": "dist/public",
   "installCommand": "echo skip",
-  "env": {
-    "PORT": "3000",
-    "BASE_PATH": "/"
-  },
   "rewrites": [
     {
       "source": "/api/:path*",
