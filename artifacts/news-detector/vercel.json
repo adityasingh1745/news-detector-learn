@@ -5,7 +5,7 @@
   "rewrites": [
     {
       "source": "/api/:path*",
-      "destination": "https://news-detector-api.onrender.com/api/:path*"
+      "destination": "https://news-detector-api-e753.onrender.com/api/:path*"
     }
   ]
 }
