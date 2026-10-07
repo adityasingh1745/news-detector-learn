@@ -1,0 +1,23 @@
+name: Keep Render services warm
+
+# Render's free tier spins down services after ~15 minutes of inactivity,
+# causing a 30-60s cold start (and apparent "model unavailable" errors) on
+# the first request afterwards. This workflow pings both backend services
+# every 10 minutes to keep them awake.
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping API server
+        run: |
+          curl -fsS --max-time 60 https://news-detector-api-e753.onrender.com/api/healthz || echo "API ping failed (service may still be waking up)"
+
+      - name: Ping ML service
+        run: |
+          curl -fsS --max-time 60 https://news-detector-ml.onrender.com/healthz || echo "ML ping failed (service may still be waking up)"
